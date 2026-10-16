@@ -1,0 +1,41 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# Databases (SQLite)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+
