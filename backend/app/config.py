@@ -1,18 +1,19 @@
 """Application configuration using pydantic-settings."""
 
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
-    app_name: str = "Sovren Backend"
     database_url: str = "sqlite+aiosqlite:///sovren.db"
-    openai_api_key: str | None = None
-    openai_model: str = "gpt-4o-mini"
+    open_router_api_key: str | None = None
+    model: str | None = None
     environment: str = "development"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
+        env_file=BASE_DIR / ".env",
         extra="ignore",
     )
 

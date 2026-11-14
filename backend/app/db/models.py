@@ -2,9 +2,10 @@
 
 import uuid
 from datetime import datetime, timezone
-from sqlmodel import Field, SQLModel
+from typing import Optional
+from sqlmodel import Field, Relationship, SQLModel
 
-from app.core.models import ApprovalStatus, TaskStatus
+from app.core.models import ApprovalStatus, ExecutionMode, TaskStatus
 
 
 class Task(SQLModel, table=True):
@@ -15,14 +16,39 @@ class Task(SQLModel, table=True):
         primary_key=True,
         index=True,
     )
+    parent_task_id: str | None = Field(
+        default=None,
+        foreign_key="tasks.id",
+        index=True,
+    )
+    root_task_id: str | None = Field(default=None, index=True)
+    step_order: int = Field(default=0, index=True)
+    execution_mode: ExecutionMode = Field(default=ExecutionMode.DYNAMIC)
+    static_module: str | None = Field(default=None)
+    skill_name: str | None = Field(default=None)
     source_type: str = Field(default="email")
-    status: TaskStatus = Field(default=TaskStatus.PENDING, index=True)
+    status: TaskStatus = Field(default=TaskStatus.QUEUED, index=True)
     context_json: str = Field(default="{}")
+    result_json: str = Field(default="{}")
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
     updated_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    parent: Optional["Task"] = Relationship(
+        back_populates="children",
+        sa_relationship_kwargs={
+            "remote_side": "Task.id",
+            "foreign_keys": "[Task.parent_task_id]",
+        },
+    )
+    children: list["Task"] = Relationship(
+        back_populates="parent",
+        sa_relationship_kwargs={
+            "foreign_keys": "[Task.parent_task_id]",
+        },
     )
 
 
@@ -37,7 +63,6 @@ class Approval(SQLModel, table=True):
     task_id: str = Field(foreign_key="tasks.id", index=True)
     tool_name: str
     proposed_args_json: str = Field(default="{}")
-    edited_args_json: str | None = Field(default=None)
     status: ApprovalStatus = Field(default=ApprovalStatus.PENDING, index=True)
     resolved_by: str | None = Field(default=None)
     created_at: datetime = Field(

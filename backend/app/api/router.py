@@ -1,6 +1,5 @@
 """FastAPI routes for email ingestion, approval resolution, audit logs, and SSE events."""
 
-from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlmodel import desc, select
@@ -9,12 +8,13 @@ from sse_starlette.sse import EventSourceResponse
 
 from app.approval.manager import default_approval_manager
 from app.config import settings
-from app.core.models import ApprovalResolution, ApprovalStatus, TaskStatus
+from app.core.llm import LLMClient
+from app.core.models import ApprovalStatus, ExecutionMode, TaskStatus, UserApprovalAction
 from app.db.database import get_session
 from app.db.models import Approval, AuditLog, Task
 from app.events.bus import default_event_bus
-from app.runtime.llm import MockLLMProvider, OpenAILLMProvider
-from app.runtime.pipeline import EmailTriagePipeline
+from app.features.email_triage import EmailTriagePipeline, email_triage_module
+from app.runtime.agent import AgentRuntime
 
 router = APIRouter(prefix="/api")
 
@@ -28,18 +28,26 @@ class IngestEmailRequest(BaseModel):
 
 
 class ResolveApprovalRequest(BaseModel):
-    action: ApprovalResolution
-    edited_args: dict[str, Any] | None = None
+    action: UserApprovalAction
     resolved_by: str = "user"
 
 
-def get_triage_pipeline() -> EmailTriagePipeline:
-    """Provide configured triage pipeline runtime."""
-    if settings.openai_api_key:
-        llm = OpenAILLMProvider()
-    else:
-        llm = MockLLMProvider()
-    return EmailTriagePipeline(llm_provider=llm)
+def get_runtime() -> AgentRuntime:
+    """Provide configured core AgentRuntime."""
+    llm = LLMClient(
+        api_key=settings.open_router_api_key or "",
+        model=settings.model or "",
+    )
+    runtime = AgentRuntime(llm_client=llm)
+    runtime.register_static_module("email_triage", email_triage_module)
+    return runtime
+
+
+def get_triage_pipeline(
+    runtime: AgentRuntime = Depends(get_runtime),
+) -> EmailTriagePipeline:
+    """Provide configured email triage feature pipeline."""
+    return EmailTriagePipeline(runtime=runtime)
 
 
 @router.post("/tasks/ingest-email")
@@ -49,7 +57,13 @@ async def ingest_email(
     pipeline: EmailTriagePipeline = Depends(get_triage_pipeline),
 ):
     """Ingest an external email and run the triage control loop."""
-    task = Task(source_type="email", status=TaskStatus.PENDING)
+    task = Task(
+        source_type="email",
+        status=TaskStatus.QUEUED,
+        execution_mode=ExecutionMode.STATIC,
+        static_module="email_triage",
+    )
+    task.root_task_id = task.id
     session.add(task)
     await session.commit()
     await session.refresh(task)
@@ -68,20 +82,24 @@ async def resolve_approval(
     approval_id: str,
     request: ResolveApprovalRequest,
     session: AsyncSession = Depends(get_session),
+    runtime: AgentRuntime = Depends(get_runtime),
 ):
-    """Approve, edit, or reject a pending approval."""
+    """Approve or reject a pending approval."""
     try:
         approval = await default_approval_manager.resolve_approval(
             session=session,
             approval_id=approval_id,
             action=request.action,
-            edited_args=request.edited_args,
             resolved_by=request.resolved_by,
         )
+        res_approval_id = approval.id
+        res_status = approval.status
+        res_task_id = approval.task_id
+        await runtime.resume_after_approval(session=session, task_id=res_task_id)
         return {
-            "approval_id": approval.id,
-            "status": approval.status,
-            "task_id": approval.task_id,
+            "approval_id": res_approval_id,
+            "status": res_status,
+            "task_id": res_task_id,
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

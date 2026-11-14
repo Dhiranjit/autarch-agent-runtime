@@ -12,6 +12,11 @@ __pycache__/
 dist/
 build/
 
+# Jupyter
+.ipynb_checkpoints/
+backend/notebooks/
+*.ipynb
+
 # Node / Frontend
 node_modules/
 frontend/dist/

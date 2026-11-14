@@ -59,12 +59,18 @@ class ToolGateway:
         entry = self._tools.get(name)
         return entry[0] if entry else None
 
-    async def execute(self, tool_name: str, args: dict[str, Any]) -> ToolResult:
+    async def execute(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        tool_call_id: str = "",
+    ) -> ToolResult:
         if tool_name not in self._tools:
             return ToolResult(
+                tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 success=False,
-                error=f"Tool '{tool_name}' not registered in Tool Gateway.",
+                output=f"Tool '{tool_name}' not registered in Tool Gateway.",
             )
 
         registration, func = self._tools[tool_name]
@@ -74,9 +80,10 @@ class ToolGateway:
             validated_args = registration.args_schema(**args)
         except ValidationError as e:
             return ToolResult(
+                tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 success=False,
-                error=f"Invalid arguments for tool '{tool_name}': {e}",
+                output=f"Invalid arguments for tool '{tool_name}': {e}",
             )
 
         # Execute callable
@@ -87,12 +94,18 @@ class ToolGateway:
             else:
                 output = func(**kwargs)
 
-            return ToolResult(tool_name=tool_name, success=True, output=output)
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                success=True,
+                output=output,
+            )
         except Exception as exc:
             return ToolResult(
+                tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 success=False,
-                error=f"Error executing tool '{tool_name}': {str(exc)}",
+                output=f"Error executing tool '{tool_name}': {str(exc)}",
             )
 
 

@@ -1,11 +1,21 @@
 """Quarantine ingestion and sanitization extractor."""
 
-import html
 import re
+import html
 from typing import Any
+from pydantic import BaseModel
+from app.core.llm import LLMClient
 
-from app.core.models import SanitizedEmail
-from app.core.protocols import LLMProvider
+
+
+class SanitizedEmail(BaseModel):
+    sender: str
+    recipient: str = ""
+    subject: str
+    clean_body: str
+    thread_id: str | None = None
+
+
 
 SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 TAG_RE = re.compile(r"<[^>]+>")
@@ -29,7 +39,7 @@ class QuarantineExtractor:
     async def extract_email(
         self,
         raw_payload: dict[str, Any],
-        llm: LLMProvider,
+        llm: LLMClient,
     ) -> SanitizedEmail:
         raw_sender = str(raw_payload.get("sender", "")).strip()
         raw_recipient = str(raw_payload.get("recipient", "")).strip()
