@@ -1,25 +1,21 @@
 export type TaskStatus =
-  | 'PENDING'
-  | 'PROCESSING'
-  | 'WAITING_APPROVAL'
+  | 'QUEUED'
   | 'EXECUTING'
+  | 'WAITING_APPROVAL'
   | 'COMPLETED'
   | 'FAILED'
 
-export type ApprovalStatus =
-  | 'pending'
-  | 'executing'
-  | 'approved'
-  | 'rejected'
-  | 'failed'
+export type ApprovalStatus = 'PENDING' | 'APPROVED' | 'REJECTED'
 
-export type ApprovalResolution = 'APPROVE' | 'EDIT' | 'REJECT'
+export type UserApprovalAction = 'APPROVE' | 'REJECT'
 
 export interface Task {
   id: string
   source_type: string
   status: TaskStatus
   context_json: string
+  messages_json?: string
+  result_json: string
   created_at: string
   updated_at: string
 }
@@ -27,31 +23,54 @@ export interface Task {
 export interface Approval {
   id: string
   task_id: string
+  tool_call_id: string
   tool_name: string
   proposed_args_json: string
-  edited_args_json?: string | null
   status: ApprovalStatus
-  resolved_by?: string | null
+  resolved_by: string | null
   created_at: string
-  resolved_at?: string | null
+  resolved_at: string | null
 }
 
-export interface AuditLog {
-  id: string
-  task_id?: string | null
-  approval_id?: string | null
-  event_type: string
-  tool_name?: string | null
-  risk_level?: number | null
-  policy_decision?: string | null
-  actor: string
-  payload_json: string
-  created_at: string
+export interface ToolInfo {
+  name: string
+  description: string
+  risk_level?: number
 }
+
+export interface ToolResultRecord {
+  tool_call_id?: string
+  tool_name: string
+  args: Record<string, unknown>
+  success: boolean
+  output: unknown
+  status?: string
+}
+
+export interface AgentStepRecord {
+  step: number
+  thought: string
+  tool_results: ToolResultRecord[]
+}
+
+export interface TaskResultPayload {
+  message?: string
+  error?: string
+  steps?: AgentStepRecord[]
+}
+
+export type SSEEventType =
+  | 'task_updated'
+  | 'agent_step'
+  | 'workflow_step'
+  | 'subagent_step'
+  | 'tool_called'
+  | 'tool_result'
+  | 'approval_requested'
+  | 'approval_resolved'
 
 export interface SSEEnvelope {
-  event_type: string
-  payload: Record<string, any>
+  event_type: SSEEventType
+  payload: Record<string, unknown>
   timestamp: string
 }
-

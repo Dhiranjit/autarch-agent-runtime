@@ -1,87 +1,56 @@
 import type {
   Approval,
-  ApprovalResolution,
   ApprovalStatus,
-  AuditLog,
   SSEEnvelope,
+  SSEEventType,
   Task,
+  TaskStatus,
+  ToolInfo,
+  UserApprovalAction,
 } from './types'
 
 const API_BASE = '/api'
 
-export interface HealthInfo {
-  status: string
-  app: string
-  provider: 'openai' | 'mock'
-  model: string
-}
-
-export async function getHealth(): Promise<HealthInfo> {
-  const res = await fetch('/health')
-  if (!res.ok) throw new Error('Health check failed')
+export async function createTask(
+  prompt: string
+): Promise<{ task_id: string; status: TaskStatus }> {
+  const res = await fetch(`${API_BASE}/tasks`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Failed to create task: ${res.statusText}`)
+  }
   return res.json()
 }
 
-export async function getTasks(limit = 50): Promise<Task[]> {
+export async function getTasks(limit = 30): Promise<Task[]> {
   const res = await fetch(`${API_BASE}/tasks?limit=${limit}`)
   if (!res.ok) throw new Error(`Failed to fetch tasks: ${res.statusText}`)
   return res.json()
 }
 
-export async function getApprovals(status?: ApprovalStatus, limit = 50): Promise<Approval[]> {
-  const url = new URL(`${window.location.origin}${API_BASE}/approvals`)
-  url.searchParams.set('limit', String(limit))
-  if (status) {
-    url.searchParams.set('status', status)
-  }
-  const res = await fetch(url.toString())
+export async function getApprovals(
+  status?: ApprovalStatus,
+  limit = 30
+): Promise<Approval[]> {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (status) params.set('status', status)
+  const res = await fetch(`${API_BASE}/approvals?${params.toString()}`)
   if (!res.ok) throw new Error(`Failed to fetch approvals: ${res.statusText}`)
-  return res.json()
-}
-
-export async function getAuditLogs(taskId?: string, limit = 100): Promise<AuditLog[]> {
-  const url = new URL(`${window.location.origin}${API_BASE}/audit`)
-  url.searchParams.set('limit', String(limit))
-  if (taskId) {
-    url.searchParams.set('task_id', taskId)
-  }
-  const res = await fetch(url.toString())
-  if (!res.ok) throw new Error(`Failed to fetch audit logs: ${res.statusText}`)
-  return res.json()
-}
-
-export async function ingestEmail(payload: {
-  sender: string
-  recipient?: string
-  subject: string
-  body: string
-  thread_id?: string
-}): Promise<{ task_id: string; status: string }> {
-  const res = await fetch(`${API_BASE}/tasks/ingest-email`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(err.detail || `Failed to ingest email: ${res.statusText}`)
-  }
   return res.json()
 }
 
 export async function resolveApproval(
   approvalId: string,
-  action: ApprovalResolution,
-  editedArgs?: Record<string, any>
-): Promise<{ approval_id: string; status: ApprovalStatus; task_id: string }> {
+  action: UserApprovalAction
+): Promise<{ approval_id: string; task_id: string; status: ApprovalStatus }> {
   const res = await fetch(`${API_BASE}/approvals/${approvalId}/resolve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      action,
-      edited_args: editedArgs,
-      resolved_by: 'user',
-    }),
+    body: JSON.stringify({ action }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
@@ -90,8 +59,14 @@ export async function resolveApproval(
   return res.json()
 }
 
+export async function getTools(): Promise<ToolInfo[]> {
+  const res = await fetch(`${API_BASE}/tools`)
+  if (!res.ok) throw new Error(`Failed to fetch tools: ${res.statusText}`)
+  return res.json()
+}
+
 export function subscribeSSE(
-  onMessage: (event: SSEEnvelope) => void,
+  onEvent: (event: SSEEnvelope) => void,
   onStatusChange?: (status: 'connected' | 'connecting' | 'disconnected') => void
 ): () => void {
   onStatusChange?.('connecting')
@@ -101,32 +76,32 @@ export function subscribeSSE(
     onStatusChange?.('connected')
   }
 
-  eventSource.onmessage = (e) => {
+  const handleMessage = (rawData: string) => {
     try {
-      const data: SSEEnvelope = JSON.parse(e.data)
-      onMessage(data)
+      const parsed: SSEEnvelope = JSON.parse(rawData)
+      onEvent(parsed)
     } catch (err) {
       console.error('Failed to parse SSE event data', err)
     }
   }
 
-  // Also listen for specific event types if backend publishes named events
-  const namedEvents = [
+  eventSource.onmessage = (e) => handleMessage(e.data)
+
+  const namedEvents: SSEEventType[] = [
     'task_updated',
+    'agent_step',
+    'workflow_step',
+    'subagent_step',
+    'tool_called',
+    'tool_result',
     'approval_requested',
     'approval_resolved',
-    'audit_logged',
   ]
-  namedEvents.forEach((eventType) => {
-    eventSource.addEventListener(eventType, (e: any) => {
-      try {
-        const data: SSEEnvelope = JSON.parse(e.data)
-        onMessage(data)
-      } catch (err) {
-        console.error(`Failed to parse SSE event for ${eventType}`, err)
-      }
+  for (const eventType of namedEvents) {
+    eventSource.addEventListener(eventType, (e: MessageEvent) => {
+      handleMessage(e.data)
     })
-  })
+  }
 
   eventSource.onerror = () => {
     onStatusChange?.('disconnected')
@@ -137,4 +112,3 @@ export function subscribeSSE(
     onStatusChange?.('disconnected')
   }
 }
-

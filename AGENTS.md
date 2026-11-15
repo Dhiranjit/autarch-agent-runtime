@@ -49,11 +49,10 @@ sovren-dev/
 │   │   ├── features/          # Domain feature workflows (email_triage.py)
 │   │   ├── policy/            # Deterministic tool risk policy engine (engine.py)
 │   │   ├── quarantine/        # Untrusted email sanitization & extraction (extractor.py)
-│   │   ├── runtime/           # Core AgentRuntime control loop (agent.py)
+│   │   ├── runtime/           # AgentRuntime, task graph & tool runner (agent.py, task_graph.py, tool_runner.py)
 │   │   ├── tools/             # Tool gateway & mock tool providers (builtin.py, registry.py)
 │   │   ├── config.py          # App settings & environment variables (.env)
 │   │   └── main.py            # FastAPI entry point & lifespan
-│   ├── tests/                 # Pytest test suite (conftest.py, test_vertical_slice.py)
 │   ├── pyproject.toml         # Backend dependencies & uv config
 │   └── uv.lock
 └── frontend/

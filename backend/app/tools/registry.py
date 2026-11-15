@@ -1,128 +1,92 @@
-"""Tool execution gateway and registry."""
+"""Tool model, OpenAI schema conversion, and execution helpers."""
 
-from collections.abc import Callable
 import inspect
 from typing import Any
 from pydantic import BaseModel, ValidationError
-
+from collections.abc import Callable, Sequence
 from app.core.models import RiskLevel, ToolResult
-from app.tools.builtin import mock_email_provider, mock_task_provider
 
 
-class CreateTaskArgs(BaseModel):
-    title: str
-    description: str = ""
-
-    model_config = {"extra": "ignore"}
-
-
-class SendEmailArgs(BaseModel):
-    to: str
-    subject: str
-    body: str
-
-    model_config = {"extra": "ignore"}
-
-
-class ToolRegistration(BaseModel):
+class Tool(BaseModel):
+    """Tool definition matching OpenAI's tool format + app metadata."""
     name: str
+    description: str
+    parameters: type[BaseModel]
     risk_level: RiskLevel
-    args_schema: type[BaseModel]
-    description: str = ""
+    func: Callable[..., Any]
 
     model_config = {"arbitrary_types_allowed": True}
 
+    def to_openai_tool(self) -> dict[str, Any]:
+        """Convert this tool into OpenAI's native function tool payload."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters.model_json_schema(),
+            },
+        }
 
-class ToolGateway:
-    """Gateway that securely dispatches tool executions with parameter validation."""
-
-    def __init__(self) -> None:
-        self._tools: dict[str, tuple[ToolRegistration, Callable]] = {}
-
-    def register(
-        self,
-        name: str,
-        risk_level: RiskLevel,
-        args_schema: type[BaseModel],
-        func: Callable,
-        description: str = "",
-    ) -> None:
-        registration = ToolRegistration(
-            name=name,
-            risk_level=risk_level,
-            args_schema=args_schema,
-            description=description,
-        )
-        self._tools[name] = (registration, func)
-
-    def get_tool(self, name: str) -> ToolRegistration | None:
-        entry = self._tools.get(name)
-        return entry[0] if entry else None
-
-    async def execute(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        tool_call_id: str = "",
-    ) -> ToolResult:
-        if tool_name not in self._tools:
+    async def execute(self, args: dict[str, Any], tool_call_id: str = "") -> ToolResult:
+        """Validate arguments with the Pydantic schema and execute the tool callable."""
+        try:
+            validated = self.parameters(**args)
+        except ValidationError as exc:
             return ToolResult(
                 tool_call_id=tool_call_id,
-                tool_name=tool_name,
+                tool_name=self.name,
                 success=False,
-                output=f"Tool '{tool_name}' not registered in Tool Gateway.",
+                output=f"Invalid arguments for tool '{self.name}': {exc}",
             )
 
-        registration, func = self._tools[tool_name]
-
-        # Validate arguments using the tool's schema
         try:
-            validated_args = registration.args_schema(**args)
-        except ValidationError as e:
-            return ToolResult(
-                tool_call_id=tool_call_id,
-                tool_name=tool_name,
-                success=False,
-                output=f"Invalid arguments for tool '{tool_name}': {e}",
-            )
-
-        # Execute callable
-        try:
-            kwargs = validated_args.model_dump()
-            if inspect.iscoroutinefunction(func):
-                output = await func(**kwargs)
+            kwargs = validated.model_dump()
+            if inspect.iscoroutinefunction(self.func):
+                output = await self.func(**kwargs)
             else:
-                output = func(**kwargs)
-
+                output = self.func(**kwargs)
             return ToolResult(
                 tool_call_id=tool_call_id,
-                tool_name=tool_name,
+                tool_name=self.name,
                 success=True,
                 output=output,
             )
         except Exception as exc:
             return ToolResult(
                 tool_call_id=tool_call_id,
-                tool_name=tool_name,
+                tool_name=self.name,
                 success=False,
-                output=f"Error executing tool '{tool_name}': {str(exc)}",
+                output=f"Error executing tool '{self.name}': {exc}",
             )
 
 
-# Default configured ToolGateway instance for Milestone 1
-default_gateway = ToolGateway()
-default_gateway.register(
-    name="create_task",
-    risk_level=RiskLevel.LEVEL_2,
-    args_schema=CreateTaskArgs,
-    func=mock_task_provider.create_task,
-    description="Create an internal task item (Level 2).",
-)
-default_gateway.register(
-    name="send_email",
-    risk_level=RiskLevel.LEVEL_3,
-    args_schema=SendEmailArgs,
-    func=mock_email_provider.send_email,
-    description="Send an outbound email (Level 3).",
-)
+def get_tool(tools: Sequence[Tool], name: str) -> Tool | None:
+    """Look up a tool by name from a collection of tools."""
+    for tool in tools:
+        if tool.name == name:
+            return tool
+    return None
 
+
+def to_openai_tools(tools: Sequence[Tool]) -> list[dict[str, Any]]:
+    """Convert a collection of tools into OpenAI's native tools payload."""
+    return [tool.to_openai_tool() for tool in tools]
+
+
+async def execute_tool(
+    tools: Sequence[Tool],
+    tool_name: str,
+    args: dict[str, Any],
+    tool_call_id: str = "",
+) -> ToolResult:
+    """Look up and execute a tool by name from a collection of tools."""
+    tool = get_tool(tools, tool_name)
+    if tool is None:
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            success=False,
+            output=f"Tool '{tool_name}' not found.",
+        )
+    return await tool.execute(args=args, tool_call_id=tool_call_id)

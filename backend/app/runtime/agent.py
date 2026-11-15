@@ -1,228 +1,307 @@
-"""Core agent runtime orchestrating static modules, dynamic turns, tools, and task graphs."""
+"""Core Orchestrator runtime with policy-gated tool loop, subagent spawning, and approval checkpointing."""
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Sequence
 import json
-from sqlalchemy.ext.asyncio import async_sessionmaker
-from sqlmodel import select
+from typing import Any
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.approval.manager import ApprovalManager, default_approval_manager
 from app.core.llm import LLMClient
-from app.core.models import (
-    AgentResponse,
-    ApprovalStatus,
-    ExecutionMode,
-    TaskStatus,
-)
-from app.db.database import async_session_maker
-from app.db.models import Approval, Task
+from app.core.models import AgentProfile, ProposedToolCall, RiskLevel, TaskStatus
+from app.db.models import Task
+from app.events.bus import default_event_bus
 from app.policy.engine import PolicyEngine
-from app.runtime.task_graph import (
-    get_task_depth,
-    has_queued_children,
-    run_next_step_group,
-    safe_json_loads,
-    spawn_subtasks,
-    transition_task,
-)
-from app.runtime.tool_runner import process_tool_calls
+from app.runtime.state import safe_json_loads, safe_json_loads_list, transition_task
+from app.runtime.subagent import SubagentRunner
+from app.runtime.tool_runner import evaluate_and_run_tool_call
+from app.tools.registry import Tool, to_openai_tools
+from app.tools.tools import ALL_TOOLS
 
-StaticModuleHandler = Callable[[AsyncSession, Task, "AgentRuntime"], Awaitable[AgentResponse]]
-
-_DYNAMIC_SYSTEM_PROMPT = (
-    "You are a personal admin assistant orchestrator. "
-    "Propose direct tool calls and/or structured subtasks without executing tools directly."
+DEFAULT_ORCHESTRATOR_PROMPT = (
+    "You are Sovren, a personal AI orchestrator. "
+    "Use the provided tools and predefined workflows (such as ingest_emails for untrusted email ingestion) "
+    "to accomplish the user's request safely. "
+    "Iterate with tool calls as needed, and when no further tool calls are required, "
+    "provide a clear, concise final response."
 )
 
 
 class AgentRuntime:
-    """Core orchestrator for static modules, dynamic planning, policy gating, and child task graphs."""
+    """Orchestrator runtime that executes a checkpointed while-tool-calls loop."""
 
     def __init__(
         self,
         llm_client: LLMClient,
+        tools: Sequence[Tool] | None = None,
         policy_engine: PolicyEngine | None = None,
-        max_depth: int = 5,
-        session_factory: async_sessionmaker[AsyncSession] = async_session_maker,
+        approval_manager: ApprovalManager = default_approval_manager,
+        max_steps: int = 8,
+        system_prompt: str = DEFAULT_ORCHESTRATOR_PROMPT,
     ) -> None:
         self.llm = llm_client
-        self.policy_engine = policy_engine or PolicyEngine()
-        self.max_depth = max_depth
-        self.session_factory = session_factory
-        self._static_modules: dict[str, StaticModuleHandler] = {}
+        self.tools: list[Tool] = list(tools) if tools is not None else list(ALL_TOOLS)
+        self.policy_engine = policy_engine or PolicyEngine(tools=self.tools)
+        self.approval_manager = approval_manager
+        self.max_steps = max_steps
+        self.system_prompt = system_prompt
 
-    def register_static_module(self, module_name: str, handler: StaticModuleHandler) -> None:
-        """Register a predefined static execution module by name."""
-        self._static_modules[module_name] = handler
+    def register_tool(self, tool: Tool) -> None:
+        """Register an additional tool or workflow tool on the orchestrator."""
+        self.tools = [t for t in self.tools if t.name != tool.name] + [tool]
+        self.policy_engine = PolicyEngine(tools=self.tools)
+
+    def register_subagent(
+        self,
+        profile: AgentProfile,
+        tools: Sequence[Tool] | None = None,
+        risk_level: RiskLevel = RiskLevel.LEVEL_0,
+    ) -> SubagentRunner:
+        """Register an isolated subagent profile as a callable tool on the orchestrator."""
+        runner = SubagentRunner(
+            profile=profile,
+            llm_client=self.llm,
+            tools=tools,
+        )
+        self.register_tool(runner.as_tool(risk_level=risk_level))
+        return runner
 
     async def run_task(
         self,
         session: AsyncSession,
         task: Task,
-        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        tools: Sequence[Tool] | None = None,
     ) -> Task:
-        """Execute a task according to its execution_mode (STATIC or DYNAMIC)."""
-        factory = session_factory or self.session_factory
-        if task.root_task_id is None:
-            task.root_task_id = task.id
+        """Execute or resume the orchestrator tool-calling loop for a task."""
         await transition_task(session, task, TaskStatus.EXECUTING)
 
+        active_tools = list(tools) if tools is not None else self.tools
+        active_policy = (
+            PolicyEngine(tools=active_tools)
+            if tools is not None
+            else self.policy_engine
+        )
+        openai_tools = to_openai_tools(active_tools) or None
+
+        existing_messages = safe_json_loads_list(task.messages_json)
+        existing_result = safe_json_loads(task.result_json)
+        raw_steps = existing_result.get("steps")
+        history: list[dict[str, Any]] = (
+            [s for s in raw_steps if isinstance(s, dict)]
+            if isinstance(raw_steps, list)
+            else []
+        )
+
+        if existing_messages:
+            messages = existing_messages
+        else:
+            task_input = safe_json_loads(task.context_json)
+            user_content = (
+                task_input["prompt"]
+                if isinstance(task_input.get("prompt"), str) and len(task_input) == 1
+                else json.dumps(task_input)
+            )
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_content},
+            ]
+
+        start_step = len(history) + 1
+
         try:
-            agent_response = await self._execute_turn(session, task)
-            return await self._apply_agent_response(
-                session=session,
-                task=task,
-                agent_response=agent_response,
-                factory=factory,
-                allow_subtasks=(task.execution_mode == ExecutionMode.DYNAMIC),
+            for step in range(start_step, self.max_steps + 1):
+                await default_event_bus.publish(
+                    "agent_step",
+                    {"task_id": task.id, "step": step, "phase": "thinking"},
+                )
+
+                assistant_msg = await self.llm.chat(
+                    messages=messages,
+                    tools=openai_tools,
+                )
+                tool_calls = [
+                    tc for tc in (assistant_msg.tool_calls or []) if tc.type == "function"
+                ]
+                content = assistant_msg.content or ""
+
+                await default_event_bus.publish(
+                    "agent_step",
+                    {
+                        "task_id": task.id,
+                        "step": step,
+                        "phase": "thought",
+                        "message": content,
+                        "tool_count": len(tool_calls),
+                    },
+                )
+
+                assistant_entry: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": assistant_msg.content,
+                }
+                if tool_calls:
+                    assistant_entry["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ]
+                messages.append(assistant_entry)
+
+                if not tool_calls:
+                    return await transition_task(
+                        session,
+                        task,
+                        TaskStatus.COMPLETED,
+                        result={"message": content, "steps": history},
+                        messages=messages,
+                    )
+
+                step_results: list[dict[str, Any]] = []
+                has_pending_approval = False
+
+                for tc in tool_calls:
+                    tool_name = tc.function.name
+                    parsed_args: dict[str, Any] = {}
+                    parse_error: str | None = None
+                    try:
+                        decoded = json.loads(tc.function.arguments or "{}")
+                        if not isinstance(decoded, dict):
+                            raise ValueError("Tool arguments must be a JSON object.")
+                        parsed_args = decoded
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        parse_error = f"Invalid JSON arguments for tool '{tool_name}': {exc}"
+
+                    await default_event_bus.publish(
+                        "tool_called",
+                        {
+                            "task_id": task.id,
+                            "step": step,
+                            "tool_call_id": tc.id,
+                            "tool_name": tool_name,
+                            "args": parsed_args,
+                        },
+                    )
+
+                    if parse_error is not None:
+                        await default_event_bus.publish(
+                            "tool_result",
+                            {
+                                "task_id": task.id,
+                                "step": step,
+                                "tool_call_id": tc.id,
+                                "tool_name": tool_name,
+                                "success": False,
+                                "output": parse_error,
+                            },
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps({
+                                "success": False,
+                                "output": parse_error,
+                            }),
+                        })
+                        step_results.append({
+                            "tool_call_id": tc.id,
+                            "tool_name": tool_name,
+                            "args": parsed_args,
+                            "success": False,
+                            "output": parse_error,
+                            "status": "INVALID_ARGS",
+                        })
+                        continue
+
+                    outcome = await evaluate_and_run_tool_call(
+                        session=session,
+                        task=task,
+                        tool_call=ProposedToolCall(
+                            id=tc.id,
+                            tool_name=tool_name,
+                            args=parsed_args,
+                        ),
+                        policy_engine=active_policy,
+                        approval_manager=self.approval_manager,
+                        tools=active_tools,
+                    )
+
+                    if outcome["status"] == "REQUIRE_APPROVAL":
+                        has_pending_approval = True
+                    else:
+                        await default_event_bus.publish(
+                            "tool_result",
+                            {
+                                "task_id": task.id,
+                                "step": step,
+                                "tool_call_id": tc.id,
+                                "tool_name": tool_name,
+                                "success": outcome["success"],
+                                "output": outcome["output"],
+                                "status": outcome["status"],
+                            },
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps({
+                                "success": outcome["success"],
+                                "status": outcome["status"],
+                                "output": outcome["output"],
+                            }),
+                        })
+                        step_results.append(outcome)
+
+                history.append({
+                    "step": step,
+                    "thought": content,
+                    "tool_results": step_results,
+                })
+
+                if has_pending_approval:
+                    return await transition_task(
+                        session,
+                        task,
+                        TaskStatus.WAITING_APPROVAL,
+                        result={"steps": history},
+                        messages=messages,
+                    )
+
+            return await transition_task(
+                session,
+                task,
+                TaskStatus.FAILED,
+                result={
+                    "error": f"Exceeded max_steps ({self.max_steps}) without completing.",
+                    "steps": history,
+                },
+                messages=messages,
             )
         except Exception as exc:
-            return await transition_task(session, task, TaskStatus.FAILED, result={"error": str(exc)})
+            return await transition_task(
+                session,
+                task,
+                TaskStatus.FAILED,
+                result={"error": str(exc), "steps": history},
+                messages=messages,
+            )
 
     async def resume_after_approval(
         self,
         session: AsyncSession,
         task_id: str,
-        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        tools: Sequence[Tool] | None = None,
     ) -> Task | None:
-        """Transition a resumed task after approval resolution and advance parent steps if ready."""
+        """Resume a paused WAITING_APPROVAL task once all its pending approvals are resolved."""
         task = await session.get(Task, task_id)
-        if not task:
+        if task is None:
             return None
 
-        factory = session_factory or self.session_factory
-
-        if task.status == TaskStatus.WAITING_APPROVAL:
-            if await self._has_pending_approvals(session, task.id):
-                return task
-
-            if self._has_failed_approved_tool(task):
-                await transition_task(session, task, TaskStatus.FAILED)
-            elif await has_queued_children(session, task.id):
-                await transition_task(session, task, TaskStatus.WAITING_CHILDREN)
-                await self._run_step_group(session, task, factory)
-            else:
-                await transition_task(session, task, TaskStatus.COMPLETED)
-        elif task.status == TaskStatus.WAITING_CHILDREN:
-            await self._run_step_group(session, task, factory)
-
-        await session.refresh(task)
-        await self._advance_ancestors(session, task, factory)
-        await session.refresh(task)
-        return task
-
-    async def _execute_turn(self, session: AsyncSession, task: Task) -> AgentResponse:
-        if task.execution_mode == ExecutionMode.STATIC:
-            if not task.static_module or task.static_module not in self._static_modules:
-                raise ValueError(f"Unknown static module: {task.static_module!r}")
-            handler = self._static_modules[task.static_module]
-            return await handler(session, task, self)
-
-        ctx = safe_json_loads(task.context_json)
-        user_prompt = json.dumps(ctx, indent=2) if ctx else "{}"
-        return await self.llm.generate_structured(
-            system_prompt=_DYNAMIC_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_model=AgentResponse,
-        )
-
-    async def _apply_agent_response(
-        self,
-        session: AsyncSession,
-        task: Task,
-        agent_response: AgentResponse,
-        factory: async_sessionmaker[AsyncSession],
-        allow_subtasks: bool,
-    ) -> Task:
-        tool_results, has_pending_approval = await process_tool_calls(
-            session=session,
-            task=task,
-            tool_calls=agent_response.proposed_tool_calls,
-            policy_engine=self.policy_engine,
-        )
-
-        subtasks = agent_response.subtasks if allow_subtasks else []
-        if subtasks:
-            depth = await get_task_depth(session, task, self.max_depth)
-            if depth >= self.max_depth:
-                return await transition_task(
-                    session,
-                    task,
-                    TaskStatus.FAILED,
-                    result={"error": f"Max task depth ({self.max_depth}) exceeded when spawning subtasks."},
-                )
-            spawn_subtasks(session, task, subtasks)
-
-        result_payload = {
-            "message": agent_response.message,
-            "tool_results": tool_results,
-        }
-
-        if has_pending_approval:
-            return await transition_task(session, task, TaskStatus.WAITING_APPROVAL, result=result_payload)
-
-        if subtasks:
-            await transition_task(session, task, TaskStatus.WAITING_CHILDREN, result=result_payload)
-            await self._run_step_group(session, task, factory)
-            await session.refresh(task)
+        if await self.approval_manager.has_pending_approvals(session, task_id):
             return task
 
-        return await transition_task(session, task, TaskStatus.COMPLETED, result=result_payload)
-
-    async def _run_step_group(
-        self,
-        session: AsyncSession,
-        parent_task: Task,
-        factory: async_sessionmaker[AsyncSession],
-    ) -> bool:
-        return await run_next_step_group(
-            session=session,
-            parent_task=parent_task,
-            run_child=lambda child_id: self._run_child_in_session(child_id, factory),
-        )
-
-    async def _run_child_in_session(
-        self,
-        child_id: str,
-        factory: async_sessionmaker[AsyncSession],
-    ) -> None:
-        async with factory() as child_session:
-            child = await child_session.get(Task, child_id)
-            if child is None:
-                return
-            await self.run_task(child_session, child, session_factory=factory)
-
-    async def _advance_ancestors(
-        self,
-        session: AsyncSession,
-        task: Task,
-        factory: async_sessionmaker[AsyncSession],
-    ) -> None:
-        current = task
-        while current.status in (TaskStatus.COMPLETED, TaskStatus.FAILED) and current.parent_task_id:
-            parent = await session.get(Task, current.parent_task_id)
-            if not parent or parent.status != TaskStatus.WAITING_CHILDREN:
-                break
-            finished = await self._run_step_group(session, parent, factory)
-            if not finished:
-                break
-            await session.refresh(parent)
-            current = parent
-
-    @staticmethod
-    async def _has_pending_approvals(session: AsyncSession, task_id: str) -> bool:
-        statement = select(Approval.id).where(
-            Approval.task_id == task_id,
-            Approval.status == ApprovalStatus.PENDING,
-        )
-        res = await session.exec(statement)
-        return res.first() is not None
-
-    @staticmethod
-    def _has_failed_approved_tool(task: Task) -> bool:
-        tool_results = safe_json_loads(task.result_json).get("tool_results", [])
-        return any(
-            isinstance(entry, dict)
-            and entry.get("status") == "APPROVED"
-            and entry.get("success") is False
-            for entry in tool_results
-        )
+        return await self.run_task(session=session, task=task, tools=tools)

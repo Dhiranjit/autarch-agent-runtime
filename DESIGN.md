@@ -1,15 +1,15 @@
 # System Design & Architecture: Sovren
 
-Sovren is a personal admin assistant built on a lightweight, framework-free Python runtime. It combines structured task-graph orchestration (`STATIC` skill pipelines and `DYNAMIC` subtask planning) with deterministic policy gating and human-in-the-loop approvals for external side effects.
+Sovren is a personal admin assistant built on a lightweight, framework-free Python runtime. It combines a native multi-turn Orchestrator loop with semi-deterministic `StateGraph` workflows (for untrusted inputs like email ingestion), isolated `SubagentRunner` delegation, deterministic policy gating, and checkpointed human-in-the-loop approvals.
 
 ---
 
 ## 1. Core Principles
 
-1. **Tools Are Proposed, Never Executed Directly:** The LLM proposes `ProposedToolCall`s and receives tool schemas only—never credentials or direct tool access. Every tool call passes through the deterministic `PolicyEngine` and `ToolGateway`.
-2. **Dynamic Graph Planning Without Extra Friction:** In `DYNAMIC` mode, the LLM can structure multi-step work by returning `SubTask` items (`step_order`, `execution_mode`, `static_module`, `skill_name`, `context`). Spawning subtasks is treated as control-flow planning (bounded by `max_depth`), while human approval is reserved strictly for high-risk tool calls.
-3. **Deny-by-Default Policy:** Unregistered tools are denied by default. Internal reads/staging/mutations (Levels 0–2) run automatically; external side effects and payments (Levels 3–4) pause for human approval.
-4. **Crash-Safe Persistence:** Tasks, task hierarchy, approvals, and append-only audit entries live in SQLite (WAL mode) so paused tasks (`WAITING_APPROVAL`, `WAITING_CHILDREN`) can resume cleanly via API calls.
+1. **Native Multi-Turn Orchestrator Loop:** The core runtime (`AgentRuntime`) iterates over native OpenAI tool calls (`while tool_calls -> execute -> repeat`) and terminates cleanly when the LLM returns a final response with no tool calls.
+2. **Predefined State Workflows as Named Tools:** Known multi-step procedures requiring strict safety guarantees (such as `email_ingestion`) are modeled using `StateGraph[StateT]` and exposed as individual named tools (`ingest_emails`). Untrusted inputs pass through deterministic sanitization (`QuarantineExtractor`) and a zero-tool structured extraction call (`LLMClient.parse_structured`).
+3. **Scoped Subagents for Context & Privilege Isolation:** When a task benefits from an isolated context window or restricted permissions, `SubagentRunner` executes an ephemeral loop with its own `AgentProfile` (`system_prompt`, `max_steps`, and read-only tools) and returns only the distilled result to the Orchestrator.
+4. **Deny-by-Default Policy & Checkpointed Approvals:** Unregistered tools are denied by default. Levels 0–2 execute automatically; Levels 3–4 (`send_email`, external side effects) checkpoint the Orchestrator's short-term working memory (`Task.messages_json`) in SQLite and pause in `WAITING_APPROVAL`. When approved or rejected, the tool result is appended to `messages_json` and the Orchestrator resumes seamlessly.
 
 ---
 
@@ -17,21 +17,22 @@ Sovren is a personal admin assistant built on a lightweight, framework-free Pyth
 
 ```mermaid
 flowchart LR
-    API["FastAPI (/api/*)"] --> Runtime["AgentRuntime"]
-    Runtime -->|"STATIC"| Skill["Registered Skill\n(e.g. email_triage)"]
-    Runtime -->|"DYNAMIC"| LLM["LLMClient\n(AgentResponse)"]
-    Skill --> Response["AgentResponse\n(proposed_tool_calls, subtasks)"]
-    LLM --> Response
+    API["FastAPI (/api/*)"] --> Orch["AgentRuntime (Orchestrator)"]
+    Orch --> LLM["LLMClient.chat(messages, tools)"]
+    LLM -->|"No tool_calls"| Done["TaskStatus.COMPLETED"]
+    LLM -->|"tool_calls"| Policy["PolicyEngine"]
 
-    Response -->|"proposed_tool_calls"| Policy["PolicyEngine"]
-    Policy -->|"ALLOW (Level 0-2)"| Gateway["ToolGateway"]
-    Policy -->|"REQUIRE_APPROVAL (Level 3-4)"| Approval["ApprovalManager\n(WAITING_APPROVAL)"]
-    Approval -->|"APPROVE / REJECT"| Runtime
+    Policy -->|"ALLOW (Level 0-2)"| Gateway["Tool Execution"]
+    Gateway -->|"Standard Tool"| Builtin["create_task / etc."]
+    Gateway -->|"Workflow Tool"| Graph["StateGraph (email_ingestion)\nfetch -> quarantine -> parse_structured"]
+    Gateway -->|"Subagent Tool"| Sub["SubagentRunner\n(Isolated messages + Scoped tools)"]
 
-    Response -->|"subtasks"| Children["Spawn Child Tasks\n(WAITING_CHILDREN)"]
-    Children -->|"step_order batches\n(asyncio.gather)"| Runtime
-    Gateway --> DB["SQLite WAL + AuditLog"]
-    DB --> SSE["EventBus -> /api/events"]
+    Policy -->|"REQUIRE_APPROVAL (Level 3-4)"| Approval["ApprovalManager\nCheckpoint Task.messages_json\n(WAITING_APPROVAL)"]
+    Approval -->|"APPROVE / REJECT"| Orch
+
+    Builtin --> Orch
+    Graph --> Orch
+    Sub --> Orch
 ```
 
 ---
@@ -41,46 +42,28 @@ flowchart LR
 ### A. Domain Models & Persistence (`backend/app/core/`, `backend/app/db/`)
 
 - **Core Enums & Schemas (`core/models.py`):**
-  - `TaskStatus`: `QUEUED`, `EXECUTING`, `WAITING_APPROVAL`, `WAITING_CHILDREN`, `COMPLETED`, `FAILED`.
-  - `ExecutionMode`: `STATIC` (runs a registered Python execution module) or `DYNAMIC` (LLM plans tool calls and/or `SubTask`s, optionally guided by a future `SKILL.md` via `skill_name`).
+  - `TaskStatus`: `QUEUED`, `EXECUTING`, `WAITING_APPROVAL`, `COMPLETED`, `FAILED`.
   - `RiskLevel`: `LEVEL_0` (read) through `LEVEL_4` (payment).
-  - `AgentResponse`: `message`, `proposed_tool_calls: list[ProposedToolCall]`, `subtasks: list[SubTask]`.
+  - `AgentProfile`: `name`, `description`, `system_prompt`, `max_steps`.
 - **SQLite WAL Tables (`db/models.py`, `db/database.py`):**
-  - `tasks`: Hierarchical task node with `id`, `parent_task_id`, `root_task_id`, `step_order`, `execution_mode`, `static_module`, `skill_name`, `source_type`, `status`, `context_json`, `result_json`, and self-referential `parent` / `children` relationships.
-  - `approvals`: Pending and resolved tool approvals (`task_id`, `tool_name`, `proposed_args_json`, `status`, `resolved_by`, `resolved_at`).
+  - `tasks`: Top-level agent run record with `id`, `source_type`, `status`, `context_json`, `messages_json` (short-term working memory checkpoint), and `result_json`.
+  - `approvals`: Pending and resolved tool approvals (`task_id`, `tool_call_id`, `tool_name`, `proposed_args_json`, `status`, `resolved_by`, `resolved_at`).
   - `audit_log`: Append-only execution and policy audit records (`task_id`, `approval_id`, `event_type`, `tool_name`, `risk_level`, `policy_decision`, `actor`, `payload_json`).
 
-### B. Hierarchical Orchestrator (`backend/app/runtime/agent.py`)
+### B. Orchestrator, State Workflows & Subagents (`backend/app/runtime/`)
 
-`AgentRuntime` drives task execution and child-graph coordination:
+- **`AgentRuntime` (`runtime/agent.py`):** Main Orchestrator owning the `while` tool-calling loop, `Task.messages_json` checkpointing, subagent/tool registration, and `resume_after_approval`.
+- **`StateGraph` (`runtime/workflow.py`):** Lightweight semi-deterministic state machine supporting sequential edges (`add_edge`), conditional routing (`add_conditional_edge`), SSE `workflow_step` events, and `.as_tool()` wrapping.
+- **`SubagentRunner` (`runtime/subagent.py`):** Isolated subagent loop with an ephemeral `messages` history and scoped `PolicyEngine`, exposed to the Orchestrator via `.as_tool()`.
+- **Tool Runner & State Helpers (`runtime/tool_runner.py`, `runtime/state.py`):** Evaluates individual tool calls against `PolicyEngine`, executes allowed tools, queues approvals, writes `AuditLog` entries, and persists task transitions.
 
-- **Static Execution (`ExecutionMode.STATIC`):** Dispatches to a registered Python module via `static_module` (`register_static_module(name, handler)`), such as `email_triage`.
-- **Dynamic Execution (`ExecutionMode.DYNAMIC`):** Calls `LLMClient.generate_structured(..., response_model=AgentResponse)` to propose tool calls and/or `SubTask`s (`skill_name` is reserved for future `SKILL.md`-driven dynamic skills).
-- **Step-Order Graph Execution:**
-  - Child `Task`s are stored as `QUEUED` with `parent_task_id`, inherited `root_task_id`, and integer `step_order`.
-  - `_run_next_step_group` executes all `QUEUED` children sharing the lowest `step_order` concurrently via `asyncio.gather` (using an isolated `AsyncSession` per child coroutine).
-  - When a `step_order` batch completes, the next `step_order` batch starts with prior step outputs injected into `context_json["prior_results"]`.
-  - Once all children finish, `_finalize_parent` aggregates child results into `parent_task.result_json` (failing the parent if any child failed) and cascades upward if the parent itself has a parent.
-- **Guards & Resumption:** `max_depth` (default `5`) prevents runaway dynamic recursion; `resume_after_approval(session, task_id)` resumes child batches or parent rollups once an approval resolves.
+### C. Quarantine & Predefined Feature Workflows (`backend/app/quarantine/`, `backend/app/features/`)
 
-### C. Quarantine & Feature Skills (`backend/app/quarantine/`, `backend/app/features/`)
-
-- **`QuarantineExtractor` (`quarantine/extractor.py`):** Deterministically strips untrusted HTML/markup and extracts structured `SanitizedEmail` data using an isolated LLM call with zero tools registered.
-- **`EmailTriagePipeline` / `email_triage_module` (`features/email_triage.py`):** Static execution module registered on `AgentRuntime` as `"email_triage"` that sanitizes inbound email and proposes triage actions as an `AgentResponse`.
+- **`QuarantineExtractor` (`quarantine/extractor.py`):** Deterministically strips untrusted HTML/scripts and normalizes `SanitizedEmail` payloads.
+- **`email_ingestion` Workflow (`features/email_triage.py`):** A 3-node `StateGraph[EmailIngestionState]` (`fetch_emails` $\rightarrow$ `quarantine_sanitize` $\rightarrow$ `extract_digest`) exposed as the `ingest_emails` tool (`RiskLevel.LEVEL_0`). The `extract_digest` node uses `LLMClient.parse_structured` with zero tools so untrusted email bodies cannot trigger tool execution.
 
 ### D. Policy Engine, Approvals & Tool Gateway (`backend/app/policy/`, `backend/app/approval/`, `backend/app/tools/`)
 
-- **`PolicyEngine` (`policy/engine.py`):** Pure Python evaluator mapping `ProposedToolCall` to `PolicyAction`:
-  - `ALLOW`: Levels 0–2 (`create_task`, internal reads/staging).
-  - `REQUIRE_APPROVAL`: Levels 3–4 (`send_email`, external side effects/payments).
-  - `DENY`: Unknown/unregistered tools or risk levels.
-- **`ApprovalManager` (`approval/manager.py`):** Persists `PENDING` approvals, handles `APPROVE` / `REJECT` resolutions, executes approved tools via `ToolGateway`, records outcomes in `task.result_json` and `audit_log`, and transitions the task to `WAITING_CHILDREN` (if queued children exist), `COMPLETED`, or `FAILED`.
-- **`ToolGateway` (`tools/registry.py`, `tools/builtin.py`):** Registry validating arguments against each tool's Pydantic schema before executing tool functions (`create_task`, `send_email`).
-
-### E. API & Real-Time Events (`backend/app/api/`, `backend/app/events/`)
-
-- **REST Endpoints (`api/router.py`):**
-  - `POST /api/tasks/ingest-email`: Creates a root `STATIC` (`email_triage`) task and runs it.
-  - `POST /api/approvals/{approval_id}/resolve`: Resolves an approval (`APPROVE` / `REJECT`) and triggers `AgentRuntime.resume_after_approval`.
-  - `GET /api/tasks`, `GET /api/approvals`, `GET /api/audit`: Query current state and audit history.
-- **SSE Stream (`events/bus.py`, `GET /api/events`):** Publishes `task_updated`, `approval_requested`, `approval_resolved`, and `audit_logged` events in real time.
+- **`PolicyEngine` (`policy/engine.py`):** Deterministic evaluator mapping `ProposedToolCall` to `ALLOW` (Levels 0–2), `REQUIRE_APPROVAL` (Levels 3–4), or `DENY`.
+- **`ApprovalManager` (`approval/manager.py`):** Persists `PENDING` approvals with `tool_call_id`, resolves `APPROVE` / `REJECT` actions, appends the `role: "tool"` outcome to `Task.messages_json`, and emits SSE updates before `AgentRuntime.resume_after_approval` resumes the loop.
+- **`Tool` Registry (`tools/registry.py`, `tools/tools.py`, `tools/builtin.py`):** Validates arguments against each tool's Pydantic schema and executes sync/async callables.

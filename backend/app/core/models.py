@@ -1,9 +1,10 @@
 """Core domain models: enums and schemas."""
+
+from datetime import datetime, timezone
+from enum import IntEnum, StrEnum
 import secrets
 from typing import Any
-from enum import IntEnum, StrEnum
 from pydantic import BaseModel, Field
-from datetime import datetime, timezone
 
 
 class RiskLevel(IntEnum):
@@ -18,19 +19,13 @@ class TaskStatus(StrEnum):
     QUEUED = "QUEUED"
     EXECUTING = "EXECUTING"
     WAITING_APPROVAL = "WAITING_APPROVAL"
-    WAITING_CHILDREN = "WAITING_CHILDREN"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
 
-class ExecutionMode(StrEnum):
-    STATIC = "STATIC"
-    DYNAMIC = "DYNAMIC"
-
-
 class ApprovalStatus(StrEnum):
     PENDING = "PENDING"    # Awaiting human or policy decision
-    APPROVED = "APPROVED"  # Permission Granted
+    APPROVED = "APPROVED"  # Permission granted
     REJECTED = "REJECTED"  # Permission denied
 
 
@@ -42,7 +37,7 @@ class UserApprovalAction(StrEnum):
 class PolicyAction(StrEnum):
     ALLOW = "ALLOW"                       # Auto-approved (execute internally)
     REQUIRE_APPROVAL = "REQUIRE_APPROVAL" # Needs human approval
-    DENY = "DENY"  
+    DENY = "DENY"
 
 
 class ProposedToolCall(BaseModel):
@@ -50,20 +45,6 @@ class ProposedToolCall(BaseModel):
     tool_name: str
     args: dict[str, Any]
     reasoning: str = ""
-
-
-class SubTask(BaseModel):
-    execution_mode: ExecutionMode
-    static_module: str | None = None
-    skill_name: str | None = None
-    step_order: int = 0
-    context: str = ""
-
-
-class AgentResponse(BaseModel):
-    message: str = ""
-    proposed_tool_calls: list[ProposedToolCall] = Field(default_factory=list)
-    subtasks: list[SubTask] = Field(default_factory=list)
 
 
 class PolicyDecision(BaseModel):
@@ -78,6 +59,15 @@ class ToolResult(BaseModel):
     tool_name: str
     success: bool
     output: Any = None
+
+
+class AgentProfile(BaseModel):
+    """Configuration for an orchestrator or specialized subagent."""
+
+    name: str
+    description: str
+    system_prompt: str
+    max_steps: int = 8
 
 
 class EventEnvelope(BaseModel):

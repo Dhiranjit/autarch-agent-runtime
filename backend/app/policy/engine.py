@@ -1,18 +1,21 @@
 """Deterministic Policy Engine enforcing safety invariants."""
 
+from collections.abc import Sequence
+
 from app.core.models import PolicyAction, PolicyDecision, ProposedToolCall, RiskLevel
-from app.tools.registry import ToolGateway, default_gateway
+from app.tools.registry import Tool, get_tool
+from app.tools.tools import ALL_TOOLS
 
 
 class PolicyEngine:
     """Pure Python deterministic policy evaluator."""
 
-    def __init__(self, gateway: ToolGateway | None = None) -> None:
-        self.gateway = gateway or default_gateway
+    def __init__(self, tools: Sequence[Tool] | None = None) -> None:
+        self.tools: list[Tool] = list(tools) if tools is not None else list(ALL_TOOLS)
 
     def evaluate(self, tool_call: ProposedToolCall) -> PolicyDecision:
         """Evaluate a proposed tool call against the tool risk matrix."""
-        tool = self.gateway.get_tool(tool_call.tool_name)
+        tool = get_tool(self.tools, tool_call.tool_name)
         if tool is None:
             return PolicyDecision(
                 tool_call_id=tool_call.id,
@@ -48,4 +51,3 @@ class PolicyEngine:
             action=PolicyAction.DENY,
             reason="Unknown risk level denied by default.",
         )
-
