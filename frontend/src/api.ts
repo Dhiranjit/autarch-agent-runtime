@@ -5,6 +5,7 @@ import type {
   SSEEventType,
   Task,
   TaskStatus,
+  Todo,
   ToolInfo,
   UserApprovalAction,
 } from './types'
@@ -63,6 +64,29 @@ export async function getTools(): Promise<ToolInfo[]> {
   const res = await fetch(`${API_BASE}/tools`)
   if (!res.ok) throw new Error(`Failed to fetch tools: ${res.statusText}`)
   return res.json()
+}
+
+export async function getTodos(limit = 50): Promise<Todo[]> {
+  const res = await fetch(`${API_BASE}/todos?limit=${limit}`)
+  if (!res.ok) throw new Error(`Failed to fetch todos: ${res.statusText}`)
+  return res.json()
+}
+
+export async function updateTodo(todoId: string, completed: boolean): Promise<Todo> {
+  const res = await fetch(`${API_BASE}/todos/${todoId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ completed }),
+  })
+  if (!res.ok) throw new Error(`Failed to update todo: ${res.statusText}`)
+  return res.json()
+}
+
+export async function deleteTodo(todoId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/todos/${todoId}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) throw new Error(`Failed to delete todo: ${res.statusText}`)
 }
 
 export function subscribeSSE(

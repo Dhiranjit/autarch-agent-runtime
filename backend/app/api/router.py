@@ -13,7 +13,7 @@ from app.config import settings
 from app.core.llm import LLMClient
 from app.core.models import ApprovalStatus, TaskStatus, UserApprovalAction
 from app.db.database import async_session_maker, get_session
-from app.db.models import Approval, Task
+from app.db.models import Approval, Task, Todo
 from app.events.bus import default_event_bus
 from app.runtime.agent import AgentRuntime
 from app.tools.tools import ALL_TOOLS
@@ -30,6 +30,10 @@ class CreateTaskRequest(BaseModel):
 class ResolveApprovalRequest(BaseModel):
     action: UserApprovalAction
     resolved_by: str = "user"
+
+
+class UpdateTodoRequest(BaseModel):
+    completed: bool
 
 
 def get_runtime() -> AgentRuntime:
@@ -152,6 +156,48 @@ async def list_tools():
         }
         for tool in ALL_TOOLS
     ]
+
+
+@router.get("/todos")
+async def list_todos(
+    session: AsyncSession = Depends(get_session),
+    limit: int = Query(default=50, le=200),
+):
+    """List permanent user todos ordered newest first."""
+    statement = select(Todo).order_by(desc(Todo.created_at)).limit(limit)
+    res = await session.exec(statement)
+    return res.all()
+
+
+@router.patch("/todos/{todo_id}")
+async def update_todo(
+    todo_id: str,
+    request: UpdateTodoRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Mark a todo as completed or incomplete."""
+    todo = await session.get(Todo, todo_id)
+    if todo is None:
+        raise HTTPException(status_code=404, detail="Todo not found.")
+    todo.completed = request.completed
+    session.add(todo)
+    await session.commit()
+    await session.refresh(todo)
+    return todo
+
+
+@router.delete("/todos/{todo_id}")
+async def delete_todo(
+    todo_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete a todo item."""
+    todo = await session.get(Todo, todo_id)
+    if todo is None:
+        raise HTTPException(status_code=404, detail="Todo not found.")
+    await session.delete(todo)
+    await session.commit()
+    return {"deleted": True, "id": todo_id}
 
 
 @router.get("/events")

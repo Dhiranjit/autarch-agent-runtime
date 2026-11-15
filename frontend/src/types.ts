@@ -38,6 +38,14 @@ export interface ToolInfo {
   risk_level?: number
 }
 
+export interface Todo {
+  id: string
+  title: string
+  description: string
+  completed: boolean
+  created_at: string
+}
+
 export interface ToolResultRecord {
   tool_call_id?: string
   tool_name: string

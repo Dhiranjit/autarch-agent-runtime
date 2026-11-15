@@ -3,9 +3,10 @@
 - **Execution effort:** If I have asked something simple and direct, do not over analyze and perform/answer the query swiftly.
 - **Strict Scope:** Touch only files directly relevant to the current task. Do not refactor unrelated code, add unsolicited features, or reformat untouched files.
 - **YAGNI & Simplicity:** Write minimal, maintainable code that solves the immediate problem. Avoid speculative abstractions, premature generic patterns, or over-engineering for hypothetical future needs.
+- **Fail Fast (No Useless Fallbacks):** Do not add or keep silent/fake fallback code paths (e.g., swallowing LLM/API errors or missing configuration with dummy heuristic fallbacks). Raise and surface errors directly unless explicitly requested.
 - **Execution Workflow:**
   - Direct fixes / local changes: Implement immediately without ceremony.
-  - Structural / multi-file architectural additions: Outline a brief bulleted plan first and wait for approval.
+  - Structural / multi-file architectural additions: Outline a plan, it should say in simple language of what we are doing and wait for approval.
 - **Context & Conventions:** Reference [DESIGN.md](DESIGN.md) for architecture. Inspect manifests (`pyproject.toml`, `package.json`) before assuming dependencies.
 
 ---

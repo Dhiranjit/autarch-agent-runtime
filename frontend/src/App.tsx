@@ -1,21 +1,68 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import {
   createTask,
+  deleteTodo,
   getApprovals,
   getTasks,
+  getTodos,
   getTools,
   resolveApproval,
   subscribeSSE,
+  updateTodo,
 } from './api'
 import type {
+  AgentStepRecord,
   Approval,
   SSEEnvelope,
+  SSEEventType,
   Task,
   TaskResultPayload,
   TaskStatus,
+  Todo,
   ToolInfo,
   UserApprovalAction,
 } from './types'
+
+interface TimelineEvent {
+  event_type: SSEEventType
+  payload: Record<string, unknown>
+  timestamp?: string
+}
+
+function stepsToTimelineEvents(steps: AgentStepRecord[]): TimelineEvent[] {
+  const events: TimelineEvent[] = []
+  for (const step of steps) {
+    events.push({
+      event_type: 'agent_step',
+      payload: {
+        step: step.step,
+        phase: 'thought',
+        message: step.thought,
+        tool_count: step.tool_results.length,
+      },
+    })
+    for (const tr of step.tool_results) {
+      events.push({
+        event_type: 'tool_called',
+        payload: {
+          step: step.step,
+          tool_name: tr.tool_name,
+          args: tr.args,
+        },
+      })
+      events.push({
+        event_type: 'tool_result',
+        payload: {
+          step: step.step,
+          tool_name: tr.tool_name,
+          success: tr.success,
+          output: tr.output,
+        },
+      })
+    }
+  }
+  return events
+}
 
 function parseJson<T>(raw: string | undefined, fallback: T): T {
   if (!raw) return fallback
@@ -61,6 +108,7 @@ function StatusBadge({ status }: { status: TaskStatus }) {
 
 export function App() {
   const [tasks, setTasks] = useState<Task[]>([])
+  const [todos, setTodos] = useState<Todo[]>([])
   const [approvals, setApprovals] = useState<Approval[]>([])
   const [resolvingId, setResolvingId] = useState<string | null>(null)
   const [tools, setTools] = useState<ToolInfo[]>([])
@@ -80,12 +128,14 @@ export function App() {
 
   const refreshState = useCallback(async () => {
     try {
-      const [taskList, pendingApprovals] = await Promise.all([
+      const [taskList, pendingApprovals, todoList] = await Promise.all([
         getTasks(30),
         getApprovals('PENDING', 30).catch(() => [] as Approval[]),
+        getTodos(50).catch(() => [] as Todo[]),
       ])
       setTasks(taskList)
       setApprovals(pendingApprovals)
+      setTodos(todoList)
       setSelectedTaskId((current) => current ?? taskList[0]?.id ?? null)
     } catch (err) {
       console.error('Failed to refresh state', err)
@@ -96,16 +146,18 @@ export function App() {
     let mounted = true
     const init = async () => {
       try {
-        const [taskList, pendingApprovals, toolList] = await Promise.all([
+        const [taskList, pendingApprovals, toolList, todoList] = await Promise.all([
           getTasks(30),
           getApprovals('PENDING', 30).catch(() => [] as Approval[]),
           getTools().catch(() => [] as ToolInfo[]),
+          getTodos(50).catch(() => [] as Todo[]),
         ])
         if (!mounted) return
         setTasks(taskList)
         setApprovals(pendingApprovals)
         setSelectedTaskId((current) => current ?? taskList[0]?.id ?? null)
         setTools(toolList)
+        setTodos(todoList)
       } catch (err) {
         console.error('Failed to load initial state', err)
       }
@@ -124,7 +176,8 @@ export function App() {
         if (
           event.event_type === 'task_updated' ||
           event.event_type === 'approval_requested' ||
-          event.event_type === 'approval_resolved'
+          event.event_type === 'approval_resolved' ||
+          (event.event_type === 'tool_result' && event.payload.tool_name === 'create_todo')
         ) {
           void refreshState()
         }
@@ -175,6 +228,24 @@ export function App() {
     }
   }
 
+  const handleToggleTodo = async (todo: Todo) => {
+    try {
+      const updated = await updateTodo(todo.id, !todo.completed)
+      setTodos((prev) => prev.map((t) => (t.id === updated.id ? updated : t)))
+    } catch (err) {
+      console.error('Failed to toggle todo', err)
+    }
+  }
+
+  const handleDeleteTodo = async (todoId: string) => {
+    try {
+      await deleteTodo(todoId)
+      setTodos((prev) => prev.filter((t) => t.id !== todoId))
+    } catch (err) {
+      console.error('Failed to delete todo', err)
+    }
+  }
+
   const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     void submitTask()
@@ -193,6 +264,8 @@ export function App() {
   const persistedResult = selectedTask
     ? parseJson<TaskResultPayload>(selectedTask.result_json, {})
     : {}
+  const timelineEvents: TimelineEvent[] =
+    liveEvents.length > 0 ? liveEvents : stepsToTimelineEvents(persistedResult.steps ?? [])
   const taskApprovals = selectedTask
     ? approvals.filter((a) => a.task_id === selectedTask.id && a.status === 'PENDING')
     : []
@@ -302,7 +375,7 @@ export function App() {
         </section>
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          <section className="lg:col-span-8 bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 space-y-4">
+          <section className="lg:col-span-8 min-w-0 bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 space-y-4">
             <div className="flex items-start justify-between gap-3 border-b border-zinc-800 pb-3">
               <div className="space-y-1 min-w-0">
                 <h2 className="text-sm font-semibold text-zinc-100 m-0">
@@ -384,20 +457,22 @@ export function App() {
             )}
 
             {selectedTask && (
-              <div className="space-y-4">
-                {liveEvents.length > 0 ? (
-                  <ol role="list" className="space-y-2.5 list-none p-0 m-0">
-                    {liveEvents.map((ev, idx) => (
+              <div className="space-y-4 min-w-0">
+                {timelineEvents.length > 0 ? (
+                  <ol role="list" className="space-y-2.5 list-none p-0 m-0 min-w-0">
+                    {timelineEvents.map((ev, idx) => (
                       <li
-                        key={`${ev.timestamp}-${idx}`}
-                        className="rounded-lg bg-zinc-950/90 border border-zinc-800/90 p-3 text-xs space-y-1.5"
+                        key={`${ev.timestamp ?? 'persisted'}-${idx}`}
+                        className="rounded-lg bg-zinc-950/90 border border-zinc-800/90 p-3 text-xs space-y-1.5 min-w-0"
                       >
                         <div className="flex items-center justify-between text-zinc-400 font-mono">
                           <span className="text-indigo-300 font-semibold">
                             {ev.event_type}
                             {typeof ev.payload.step === 'number' ? ` • Step ${ev.payload.step}` : ''}
                           </span>
-                          <span>{new Date(ev.timestamp).toLocaleTimeString()}</span>
+                          {ev.timestamp && (
+                            <span>{new Date(ev.timestamp).toLocaleTimeString()}</span>
+                          )}
                         </div>
 
                         {ev.event_type === 'agent_step' && (
@@ -406,7 +481,7 @@ export function App() {
                               <span className="text-zinc-400">Calling LLM…</span>
                             ) : (
                               <div className="space-y-1">
-                                <p className="m-0">
+                                <p className="m-0 break-words">
                                   {String(ev.payload.message || '(no message)')}
                                 </p>
                                 <p className="m-0 text-zinc-400 font-mono">
@@ -433,18 +508,18 @@ export function App() {
                         )}
 
                         {ev.event_type === 'tool_called' && (
-                          <div className="space-y-1">
+                          <div className="space-y-1 min-w-0">
                             <div className="font-mono text-amber-300">
                               ▶ {String(ev.payload.tool_name)}
                             </div>
-                            <pre className="m-0 p-2 rounded bg-zinc-900 text-zinc-300 overflow-x-auto font-mono">
+                            <pre className="m-0 p-2 rounded bg-zinc-900 text-zinc-300 overflow-x-auto max-w-full font-mono">
                               {JSON.stringify(ev.payload.args, null, 2)}
                             </pre>
                           </div>
                         )}
 
                         {ev.event_type === 'tool_result' && (
-                          <div className="space-y-1">
+                          <div className="space-y-1 min-w-0">
                             <div
                               className={`font-mono ${
                                 ev.payload.success ? 'text-emerald-400' : 'text-rose-400'
@@ -452,7 +527,7 @@ export function App() {
                             >
                               {ev.payload.success ? '✓' : '✕'} {String(ev.payload.tool_name)} result
                             </div>
-                            <pre className="m-0 p-2 rounded bg-zinc-900 text-zinc-300 overflow-x-auto font-mono">
+                            <pre className="m-0 p-2 rounded bg-zinc-900 text-zinc-300 overflow-x-auto max-w-full font-mono">
                               {JSON.stringify(ev.payload.output, null, 2)}
                             </pre>
                           </div>
@@ -478,33 +553,6 @@ export function App() {
                             Task status → {String(ev.payload.status)}
                           </div>
                         )}
-                      </li>
-                    ))}
-                  </ol>
-                ) : persistedResult.steps && persistedResult.steps.length > 0 ? (
-                  <ol role="list" className="space-y-2.5 list-none p-0 m-0">
-                    {persistedResult.steps.map((step) => (
-                      <li
-                        key={step.step}
-                        className="rounded-lg bg-zinc-950/90 border border-zinc-800/90 p-3 text-xs space-y-2"
-                      >
-                        <div className="font-mono text-indigo-300 font-semibold">
-                          Step {step.step}
-                        </div>
-                        {step.thought && <p className="m-0 text-zinc-200">{step.thought}</p>}
-                        {step.tool_results.map((tr, i) => (
-                          <div key={i} className="rounded bg-zinc-900 p-2 space-y-1 font-mono">
-                            <div className={tr.success ? 'text-emerald-400' : 'text-rose-400'}>
-                              {tr.success ? '✓' : '✕'} {tr.tool_name}
-                            </div>
-                            <div className="text-zinc-400">
-                              args: {JSON.stringify(tr.args)}
-                            </div>
-                            <div className="text-zinc-200">
-                              output: {JSON.stringify(tr.output)}
-                            </div>
-                          </div>
-                        ))}
                       </li>
                     ))}
                   </ol>
@@ -536,40 +584,159 @@ export function App() {
             )}
           </section>
 
-          <aside className="lg:col-span-4 bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 space-y-3">
-            <h2 className="text-sm font-semibold text-zinc-100 m-0">Recent Tasks</h2>
-            {tasks.length === 0 ? (
-              <p className="text-xs text-zinc-500 m-0">No tasks yet.</p>
-            ) : (
-              <ul role="list" className="space-y-2 list-none p-0 m-0">
-                {tasks.map((task) => {
-                  const isSelected = selectedTask?.id === task.id
-                  return (
-                    <li key={task.id}>
+          <aside className="lg:col-span-4 min-w-0 space-y-6">
+            <section className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-sm font-semibold text-zinc-100 m-0">Pending Approvals</h2>
+                <span
+                  className={`text-xs font-mono ${
+                    approvals.length > 0 ? 'text-amber-300' : 'text-zinc-500'
+                  }`}
+                >
+                  {approvals.length} pending
+                </span>
+              </div>
+              {approvals.length === 0 ? (
+                <p className="text-xs text-zinc-500 m-0">No approvals waiting.</p>
+              ) : (
+                <ul role="list" className="space-y-2 list-none p-0 m-0">
+                  {approvals.map((approval) => {
+                    const args = parseJson<Record<string, unknown>>(
+                      approval.proposed_args_json,
+                      {}
+                    )
+                    const isBusy = resolvingId === approval.id
+                    return (
+                      <li
+                        key={approval.id}
+                        className="rounded-lg bg-amber-950/20 border border-amber-800/60 p-3 space-y-2 text-xs"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-mono font-semibold text-amber-200 truncate">
+                            {approval.tool_name}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedTaskId(approval.task_id)}
+                            className="text-[11px] font-mono text-indigo-300 hover:text-indigo-200 cursor-pointer shrink-0"
+                          >
+                            View task
+                          </button>
+                        </div>
+                        <pre className="m-0 p-2 rounded bg-zinc-950/80 text-zinc-300 overflow-x-auto max-w-full font-mono text-[11px]">
+                          {JSON.stringify(args, null, 2)}
+                        </pre>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => void handleResolveApproval(approval.id, 'APPROVE')}
+                            className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-medium cursor-pointer"
+                          >
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => void handleResolveApproval(approval.id, 'REJECT')}
+                            className="px-2.5 py-1 rounded bg-rose-700 hover:bg-rose-600 disabled:opacity-60 text-white font-medium cursor-pointer"
+                          >
+                            Reject
+                          </button>
+                        </div>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+            </section>
+
+            <section className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-sm font-semibold text-zinc-100 m-0">Todo List</h2>
+                <span className="text-xs font-mono text-zinc-400">
+                  {todos.filter((t) => !t.completed).length} open
+                </span>
+              </div>
+              {todos.length === 0 ? (
+                <p className="text-xs text-zinc-500 m-0">No saved to-dos yet.</p>
+              ) : (
+                <ul role="list" className="space-y-2 list-none p-0 m-0">
+                  {todos.map((todo) => (
+                    <li
+                      key={todo.id}
+                      className="rounded-lg bg-zinc-950/70 border border-zinc-800 p-3 flex items-start gap-2.5"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={todo.completed}
+                        aria-label={`Mark "${todo.title}" as ${todo.completed ? 'incomplete' : 'complete'}`}
+                        onChange={() => void handleToggleTodo(todo)}
+                        className="mt-0.5 accent-indigo-500 cursor-pointer shrink-0"
+                      />
+                      <div className="min-w-0 flex-1 space-y-0.5">
+                        <p
+                          className={`text-xs font-medium m-0 break-words ${
+                            todo.completed ? 'line-through text-zinc-500' : 'text-zinc-200'
+                          }`}
+                        >
+                          {todo.title}
+                        </p>
+                        {todo.description && (
+                          <p className="text-[11px] text-zinc-400 m-0 break-words">
+                            {todo.description}
+                          </p>
+                        )}
+                      </div>
                       <button
                         type="button"
-                        onClick={() => setSelectedTaskId(task.id)}
-                        className={`w-full text-left rounded-lg p-3 border transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-indigo-400 focus-visible:outline-offset-2 ${
-                          isSelected
-                            ? 'bg-zinc-800/90 border-indigo-500/70'
-                            : 'bg-zinc-950/70 border-zinc-800 hover:border-zinc-700'
-                        }`}
+                        aria-label={`Delete "${todo.title}"`}
+                        onClick={() => void handleDeleteTodo(todo.id)}
+                        className="text-xs text-zinc-500 hover:text-rose-400 px-1 cursor-pointer shrink-0"
                       >
-                        <div className="flex items-center justify-between gap-2 mb-1">
-                          <StatusBadge status={task.status} />
-                          <span className="text-[11px] font-mono text-zinc-500">
-                            {new Date(task.created_at).toLocaleTimeString()}
-                          </span>
-                        </div>
-                        <p className="text-xs text-zinc-200 m-0 line-clamp-2">
-                          {extractTaskPrompt(task)}
-                        </p>
+                        ✕
                       </button>
                     </li>
-                  )
-                })}
-              </ul>
-            )}
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            <section className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 space-y-3">
+              <h2 className="text-sm font-semibold text-zinc-100 m-0">Recent Tasks</h2>
+              {tasks.length === 0 ? (
+                <p className="text-xs text-zinc-500 m-0">No tasks yet.</p>
+              ) : (
+                <ul role="list" className="space-y-2 list-none p-0 m-0">
+                  {tasks.map((task) => {
+                    const isSelected = selectedTask?.id === task.id
+                    return (
+                      <li key={task.id}>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedTaskId(task.id)}
+                          className={`w-full text-left rounded-lg p-3 border transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-indigo-400 focus-visible:outline-offset-2 ${
+                            isSelected
+                              ? 'bg-zinc-800/90 border-indigo-500/70'
+                              : 'bg-zinc-950/70 border-zinc-800 hover:border-zinc-700'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2 mb-1">
+                            <StatusBadge status={task.status} />
+                            <span className="text-[11px] font-mono text-zinc-500">
+                              {new Date(task.created_at).toLocaleTimeString()}
+                            </span>
+                          </div>
+                          <p className="text-xs text-zinc-200 m-0 line-clamp-2">
+                            {extractTaskPrompt(task)}
+                          </p>
+                        </button>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+            </section>
           </aside>
         </div>
       </main>

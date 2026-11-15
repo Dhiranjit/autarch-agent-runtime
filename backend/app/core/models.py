@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 class RiskLevel(IntEnum):
     LEVEL_0 = 0  # Read-only
     LEVEL_1 = 1  # Stage / Prepare
-    LEVEL_2 = 2  # Internal state mutation (e.g. create_task)
+    LEVEL_2 = 2  # Internal state mutation (e.g. create_todo)
     LEVEL_3 = 3  # External side effect (e.g. send_email)
     LEVEL_4 = 4  # Payment Permission
 

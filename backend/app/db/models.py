@@ -67,3 +67,19 @@ class AuditLog(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+
+
+class Todo(SQLModel, table=True):
+    __tablename__ = "todos"
+
+    id: str = Field(
+        default_factory=lambda: f"todo_{uuid.uuid4().hex[:8]}",
+        primary_key=True,
+        index=True,
+    )
+    title: str
+    description: str = Field(default="")
+    completed: bool = Field(default=False, index=True)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )

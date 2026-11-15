@@ -4,28 +4,42 @@ from pydantic import BaseModel
 
 from app.core.models import RiskLevel
 from app.features.email_triage import build_ingest_emails_tool
-from app.tools.builtin import mock_email_provider, mock_task_provider
+from app.tools.builtin import mock_email_provider, todo_provider
 from app.tools.registry import Tool
 
 
-# --- Task tools ---
+# --- Todo tools ---
 
-class CreateTaskArgs(BaseModel):
+class CreateTodoArgs(BaseModel):
     title: str
     description: str = ""
 
     model_config = {"extra": "ignore"}
 
 
-create_task_tool = Tool(
-    name="create_task",
-    description="Create an internal task item (Level 2).",
-    parameters=CreateTaskArgs,
+class ListTodosArgs(BaseModel):
+    include_completed: bool = False
+
+    model_config = {"extra": "ignore"}
+
+
+create_todo_tool = Tool(
+    name="create_todo",
+    description="Save a permanent user to-do / reminder item in the Todo list (Level 2).",
+    parameters=CreateTodoArgs,
     risk_level=RiskLevel.LEVEL_2,
-    func=mock_task_provider.create_task,
+    func=todo_provider.create_todo,
 )
 
-TASK_TOOLS: list[Tool] = [create_task_tool]
+list_todos_tool = Tool(
+    name="list_todos",
+    description="Read saved items from the permanent Todo list (Level 0).",
+    parameters=ListTodosArgs,
+    risk_level=RiskLevel.LEVEL_0,
+    func=todo_provider.list_todos,
+)
+
+TODO_TOOLS: list[Tool] = [create_todo_tool, list_todos_tool]
 
 
 # --- Email tools & Predefined Workflows ---
@@ -43,7 +57,10 @@ class SendEmailArgs(BaseModel):
 
 send_email_tool = Tool(
     name="send_email",
-    description="Send an outbound email (Level 3 - requires human approval).",
+    description=(
+        "Draft and propose an outbound email for human approval "
+        "(Level 3 — calling this pauses for Approve/Reject in the UI before sending)."
+    ),
     parameters=SendEmailArgs,
     risk_level=RiskLevel.LEVEL_3,
     func=mock_email_provider.send_email,
@@ -55,6 +72,6 @@ EMAIL_TOOLS: list[Tool] = [ingest_emails_tool, send_email_tool]
 # --- Aggregated tools ---
 
 ALL_TOOLS: list[Tool] = [
-    *TASK_TOOLS,
+    *TODO_TOOLS,
     *EMAIL_TOOLS,
 ]
