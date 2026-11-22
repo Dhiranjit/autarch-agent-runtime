@@ -1,106 +1,72 @@
-# Agent Guidelines
+# AGENTS.md
 
-- **Execution effort:** If I have asked something simple and direct, do not over analyze and perform/answer the query swiftly.
-- **Strict Scope:** Touch only files directly relevant to the current task. Do not refactor unrelated code, add unsolicited features, or reformat untouched files.
-- **YAGNI & Simplicity:** Write minimal, maintainable code that solves the immediate problem. Avoid speculative abstractions, premature generic patterns, or over-engineering for hypothetical future needs.
-- **Fail Fast (No Useless Fallbacks):** Do not add or keep silent/fake fallback code paths (e.g., swallowing LLM/API errors or missing configuration with dummy heuristic fallbacks). Raise and surface errors directly unless explicitly requested.
-- **Execution Workflow:**
-  - Direct fixes / local changes: Implement immediately without ceremony.
-  - Structural / multi-file architectural additions: Outline a plan, it should say in simple language of what we are doing and wait for approval.
-- **Context & Conventions:** Reference [DESIGN.md](DESIGN.md) for architecture. Inspect manifests (`pyproject.toml`, `package.json`) before assuming dependencies.
+## Project Description
 
----
+**Sovren** is a personal admin assistant built on a lightweight, framework-free Python agent runtime. It combines a multi-turn tool-calling orchestrator, semi-deterministic state workflows for untrusted inputs (such as email ingestion), scoped subagents, a deny-by-default policy engine, and checkpointed human-in-the-loop approvals, backed by a FastAPI API and a React + Vite frontend.
 
-## Tech Stack
+- **Detailed Architecture:** Refer to `DESIGN.md` for the heavy architecture and system design.
+- **Alignment Note:** `DESIGN.md` and the codebase currently have contradictions and non-alignment; both are in the process of being updated. Treat `DESIGN.md` as directional architecture context and verify implementation details directly against the code when needed.
 
-### Backend
+## Behavioral Preferences
 
-- **Language / Runtime:** Python `>=3.12`
-- **Package & Environment Manager:** `uv`
-- **Framework:** FastAPI (`uvicorn`)
-- **Database / ORM:** SQLite (`aiosqlite`, WAL mode enabled) + SQLModel
-- **AI / LLM:** OpenAI SDK (`AsyncOpenAI` via OpenRouter with Structured Outputs via `beta.chat.completions.parse`)
-- **Validation:** Pydantic v2 & `pydantic-settings`
-- **Streaming:** `sse-starlette` (Server-Sent Events)
-- **Testing:** `pytest`, `pytest-asyncio`, `httpx`
+- **Context Source:** The tech stack, environment setup, tools used, and a top-level directory structure will be provided in `AGENTS.md` itself. Do not infer or run bash commands to gather environment context or waste time checking virtual environments or libraries. For Python projects, refer to `pyproject.toml`.
 
-### Frontend
+- **Focused Execution & Multi-File Changes:** When I give you a task, focus on that specific task without deviating or doing unnecessary work. If a requirement is genuinely ambiguous, ask a brief clarifying question instead of guessing. For architectural or multi-file changes, briefly outline the plan and wait for my approval before writing code. Keep the explanation simple and concise, focusing on the high-level overview and system behavior—do not list file-by-file changes.
 
-- **Framework / Runtime:** React 19 + TypeScript
-- **Build Tool:** Vite (`@vitejs/plugin-react`)
-- **Styling:** Tailwind CSS v4 (`@tailwindcss/vite`)
-- **Linter:** `oxlint`
-- **Package Manager:** `npm`
+- **Simple Tasks or Changes:** Execute them quickly and immediately.
 
----
+- **Coding Preferences:** I prefer minimal implementations of core modules. Do not add exception handling or other non-functional features in the initial iterations.
 
-## Directory Structure
+- **Tool Naming Convention:** All capabilities (atomic tools, workflow pipelines, and subagent spawning) are wired as standard `Tool` instances using consistent `snake_case` names:
+  - **Read tools (`LEVEL_0`):** `<domain>_<read_verb>` (`list`, `get`, `search`) — e.g. `todo_list`, `email_get`
+  - **Action / write tools (`LEVEL_2+`):** `<domain>_<action_verb>` (`create`, `update`, `delete`, `send`) — e.g. `todo_create`, `email_send`
+  - **Pipeline / workflow tools:** `workflow_<name>` — e.g. `workflow_ingest_emails`
+  - **Subagent spawner:** `spawn_subagent`
+
+## Tech Stack and Setup Information
+
+### Backend (`backend/`)
+
+- **Runtime & Package Manager:** Python `>=3.12`, managed with `uv` (`backend/pyproject.toml`, `backend/uv.lock`).
+- **Frameworks & Libraries:** FastAPI, Uvicorn, SQLModel + `aiosqlite` (SQLite), `openai` SDK, Pydantic / `pydantic-settings`, `sse-starlette`.
+- **Dev & Testing:** `pytest`, `pytest-asyncio`, `httpx`, `ipykernel`.
+- **Configuration:** Environment variables loaded from `backend/.env` via `app/config.py` (`DATABASE_URL`, `OPEN_ROUTER_API_KEY`, `MODEL`, `ENVIRONMENT`).
+- **Commands (run from `backend/`):**
+  - Start API server: `uv run uvicorn app.main:app --reload`
+
+### Frontend (`frontend/`)
+
+- **Stack:** React 19, TypeScript, Vite 8, Tailwind CSS v4 (`@tailwindcss/vite`), `oxlint` (`frontend/package.json`).
+- **Dev Setup:** Vite dev server on port `5173`, proxying `/api` to `http://localhost:8000` (`frontend/vite.config.ts`).
+
+## Directory Structure (High-Level Overview)
 
 ```text
 sovren-dev/
-├── AGENTS.md                  # Project rules, tech stack, and conventions
-├── DESIGN.md                  # System architecture, schemas, and pipeline design
+├── AGENTS.md                  # Agent instructions, tech stack, and repo overview
+├── DESIGN.md                  # Heavy architecture & system design (currently being aligned with code)
+├── README.md
 ├── backend/
+│   ├── pyproject.toml         # Python dependencies & pytest config
+│   ├── uv.lock
 │   ├── app/
-│   │   ├── api/               # FastAPI endpoints & SSE streams (router.py)
-│   │   ├── approval/          # Human-in-the-loop approval manager (manager.py)
-│   │   ├── core/              # Shared domain models, enums & LLMClient (models.py, llm.py)
-│   │   ├── db/                # SQLModel database session & schema (database.py, models.py)
-│   │   ├── events/            # In-memory pub/sub event bus (bus.py)
-│   │   ├── features/          # Domain feature workflows (email_triage.py)
-│   │   ├── policy/            # Deterministic tool risk policy engine (engine.py)
-│   │   ├── quarantine/        # Untrusted email sanitization & extraction (extractor.py)
-│   │   ├── runtime/           # AgentRuntime, task graph & tool runner (agent.py, task_graph.py, tool_runner.py)
-│   │   ├── tools/             # Tool gateway & mock tool providers (builtin.py, registry.py)
-│   │   ├── config.py          # App settings & environment variables (.env)
-│   │   └── main.py            # FastAPI entry point & lifespan
-│   ├── pyproject.toml         # Backend dependencies & uv config
-│   └── uv.lock
+│   │   ├── main.py            # FastAPI entrypoint, lifespan, CORS, router mounting
+│   │   ├── config.py          # pydantic-settings configuration
+│   │   ├── api/               # HTTP & SSE API routes
+│   │   ├── approval/          # Human-in-the-loop approval manager
+│   │   ├── core/              # Core models/schemas and LLM client
+│   │   ├── db/                # SQLite/SQLModel database setup & ORM models
+│   │   ├── events/            # Event bus for real-time updates (SSE)
+│   │   ├── features/          # Predefined workflows (e.g., email triage)
+│   │   ├── policy/            # Deny-by-default policy engine
+│   │   ├── quarantine/        # Deterministic sanitization for untrusted inputs
+│   │   ├── runtime/           # Orchestrator, state graph, subagent runner, tool runner
+│   │   └── tools/             # Tool registry and built-in tools
+│   └── notebooks/             # Scratch/experimental notebooks
 └── frontend/
-    ├── src/
-    │   ├── components/        # React components (ApprovalCard, AuditTimeline, etc.)
-    │   ├── api.ts             # Backend API client & SSE consumer
-    │   ├── types.ts           # Frontend TypeScript type definitions
-    │   ├── App.tsx            # Main application UI container
-    │   └── main.tsx           # React DOM root entry point
-    ├── package.json           # Frontend dependencies & npm scripts
-    ├── tsconfig.json
-    └── vite.config.ts
-```
-
----
-
-## Common Commands
-
-### Backend
-
-```bash
-# Navigate to backend directory
-cd backend
-
-# Run the development server
-uv run uvicorn app.main:app --reload --port 8000
-
-# Run tests
-uv run pytest
-
-# Add / install dependencies
-uv add <package-name>
-uv add --dev <package-name>
-```
-
-### Frontend
-
-```bash
-# Navigate to frontend directory
-cd frontend
-
-# Run local development server
-npm run dev
-
-# Run type check and production build
-npm run build
-
-# Run linter
-npm run lint
+    ├── package.json           # Frontend dependencies & scripts
+    ├── vite.config.ts         # Vite + Tailwind config & /api dev proxy
+    ├── index.html
+    ├── public/
+    └── src/                   # React + TypeScript app (App.tsx, api.ts, types.ts)
 ```

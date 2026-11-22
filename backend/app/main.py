@@ -7,12 +7,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import router as api_router
 from app.config import settings
 from app.db.database import init_db
+from app.runtime.context import default_memory_store
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan handler to initialize SQLite tables on startup."""
+    """Lifespan handler to initialize SQLite tables and memory files on startup."""
     await init_db()
+    default_memory_store.ensure_files()
     yield
 
 

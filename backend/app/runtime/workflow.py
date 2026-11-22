@@ -28,8 +28,6 @@ class StateGraph[StateT: BaseModel]:
 
     def add_node(self, name: str, fn: NodeFn[StateT]) -> "StateGraph[StateT]":
         """Register a named processing node."""
-        if name == END:
-            raise ValueError(f"Node name cannot be reserved sentinel '{END}'.")
         self._nodes[name] = fn
         if self._entry_point is None:
             self._entry_point = name
@@ -58,29 +56,12 @@ class StateGraph[StateT: BaseModel]:
         self,
         initial_state: StateT,
         task_id: str | None = None,
-        max_transitions: int = 25,
     ) -> StateT:
         """Execute the state graph from entry_point until END."""
-        if self._entry_point is None:
-            raise RuntimeError(f"StateGraph '{self.name}' has no entry point configured.")
-
-        current_node = self._entry_point
+        current_node = self._entry_point or END
         state = initial_state
-        steps = 0
 
         while current_node != END:
-            steps += 1
-            if steps > max_transitions:
-                raise RuntimeError(
-                    f"StateGraph '{self.name}' exceeded max_transitions ({max_transitions})."
-                )
-
-            node_fn = self._nodes.get(current_node)
-            if node_fn is None:
-                raise RuntimeError(
-                    f"Node '{current_node}' is not registered in StateGraph '{self.name}'."
-                )
-
             await default_event_bus.publish(
                 "workflow_step",
                 {
@@ -91,11 +72,8 @@ class StateGraph[StateT: BaseModel]:
                 },
             )
 
-            result = node_fn(state)
-            if inspect.isawaitable(result):
-                state = await result
-            else:
-                state = result
+            result = self._nodes[current_node](state)
+            state = await result if inspect.isawaitable(result) else result
 
             await default_event_bus.publish(
                 "workflow_step",
@@ -109,10 +87,8 @@ class StateGraph[StateT: BaseModel]:
 
             if current_node in self._conditional_edges:
                 current_node = self._conditional_edges[current_node](state)
-            elif current_node in self._edges:
-                current_node = self._edges[current_node]
             else:
-                current_node = END
+                current_node = self._edges.get(current_node, END)
 
         return state
 

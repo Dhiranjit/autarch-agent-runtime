@@ -11,27 +11,13 @@ from app.events.bus import default_event_bus
 
 
 def safe_json_loads(raw: str | None) -> dict[str, Any]:
-    """Parse a JSON string into a dict, wrapping non-dict or invalid payloads safely."""
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {"value": parsed}
-    except json.JSONDecodeError:
-        return {"raw": raw}
+    """Parse a JSON string into a dict."""
+    return json.loads(raw) if raw else {}
 
 
 def safe_json_loads_list(raw: str | None) -> list[dict[str, Any]]:
-    """Parse a JSON string into a list of dicts safely."""
-    if not raw:
-        return []
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return [item for item in parsed if isinstance(item, dict)]
-        return []
-    except json.JSONDecodeError:
-        return []
+    """Parse a JSON string into a list of dicts."""
+    return json.loads(raw) if raw else []
 
 
 async def transition_task(

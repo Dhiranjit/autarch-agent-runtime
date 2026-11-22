@@ -10,7 +10,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from app.approval.manager import default_approval_manager
 from app.config import settings
-from app.core.llm import LLMClient
+from app.core.llm_client import LLMClient
 from app.core.models import ApprovalStatus, TaskStatus, UserApprovalAction
 from app.db.database import async_session_maker, get_session
 from app.db.models import Approval, Task, Todo

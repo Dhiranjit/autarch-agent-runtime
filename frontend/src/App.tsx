@@ -177,7 +177,7 @@ export function App() {
           event.event_type === 'task_updated' ||
           event.event_type === 'approval_requested' ||
           event.event_type === 'approval_resolved' ||
-          (event.event_type === 'tool_result' && event.payload.tool_name === 'create_todo')
+          (event.event_type === 'tool_result' && event.payload.tool_name === 'todo_create')
         ) {
           void refreshState()
         }

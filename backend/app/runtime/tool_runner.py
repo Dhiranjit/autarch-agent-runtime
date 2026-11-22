@@ -1,6 +1,5 @@
 """Policy-gated tool execution and audit logging for the Orchestrator loop."""
 
-from collections.abc import Sequence
 import json
 from typing import Any
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -9,7 +8,7 @@ from app.approval.manager import ApprovalManager, default_approval_manager
 from app.core.models import PolicyAction, ProposedToolCall
 from app.db.models import AuditLog, Task
 from app.policy.engine import PolicyEngine
-from app.tools.registry import Tool, execute_tool, get_tool
+from app.tools.registry import execute_tool, get_tool
 
 
 def _log_tool_audit(
@@ -40,17 +39,16 @@ async def evaluate_and_run_tool_call(
     tool_call: ProposedToolCall,
     policy_engine: PolicyEngine,
     approval_manager: ApprovalManager = default_approval_manager,
-    tools: Sequence[Tool] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a single tool call against PolicyEngine; execute, deny, or request approval."""
-    active_tools = list(tools) if tools is not None else policy_engine.tools
+    tools = policy_engine.tools
     decision = policy_engine.evaluate(tool_call)
-    tool = get_tool(active_tools, tool_call.tool_name)
+    tool = get_tool(tools, tool_call.tool_name)
     risk_level = int(tool.risk_level) if tool else None
 
     if decision.action == PolicyAction.ALLOW:
         tool_res = await execute_tool(
-            active_tools,
+            tools,
             tool_call.tool_name,
             tool_call.args,
             tool_call_id=tool_call.id,
@@ -84,7 +82,6 @@ async def evaluate_and_run_tool_call(
             session=session,
             task_id=task.id,
             tool_call=tool_call,
-            tools=active_tools,
         )
         return {
             "tool_call_id": tool_call.id,
@@ -119,29 +116,3 @@ async def evaluate_and_run_tool_call(
         "status": "DENY",
         "reason": decision.reason,
     }
-
-
-async def process_tool_calls(
-    session: AsyncSession,
-    task: Task,
-    tool_calls: list[ProposedToolCall],
-    policy_engine: PolicyEngine,
-    approval_manager: ApprovalManager = default_approval_manager,
-    tools: Sequence[Tool] | None = None,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Evaluate a batch of tool calls against policy, executing allowed tools or queuing approvals."""
-    results: list[dict[str, Any]] = []
-    has_pending_approval = False
-    for tc in tool_calls:
-        outcome = await evaluate_and_run_tool_call(
-            session=session,
-            task=task,
-            tool_call=tc,
-            policy_engine=policy_engine,
-            approval_manager=approval_manager,
-            tools=tools,
-        )
-        if outcome["status"] == "REQUIRE_APPROVAL":
-            has_pending_approval = True
-        results.append(outcome)
-    return results, has_pending_approval

@@ -4,14 +4,17 @@ from collections.abc import Sequence
 
 from app.core.models import PolicyAction, PolicyDecision, ProposedToolCall, RiskLevel
 from app.tools.registry import Tool, get_tool
-from app.tools.tools import ALL_TOOLS
 
 
 class PolicyEngine:
     """Pure Python deterministic policy evaluator."""
 
     def __init__(self, tools: Sequence[Tool] | None = None) -> None:
-        self.tools: list[Tool] = list(tools) if tools is not None else list(ALL_TOOLS)
+        if tools is None:
+            from app.tools.tools import ALL_TOOLS
+            self.tools: list[Tool] = list(ALL_TOOLS)
+        else:
+            self.tools = list(tools)
 
     def evaluate(self, tool_call: ProposedToolCall) -> PolicyDecision:
         """Evaluate a proposed tool call against the tool risk matrix."""

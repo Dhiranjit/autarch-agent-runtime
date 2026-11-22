@@ -10,8 +10,8 @@ from pydantic import BaseModel, Field
 class RiskLevel(IntEnum):
     LEVEL_0 = 0  # Read-only
     LEVEL_1 = 1  # Stage / Prepare
-    LEVEL_2 = 2  # Internal state mutation (e.g. create_todo)
-    LEVEL_3 = 3  # External side effect (e.g. send_email)
+    LEVEL_2 = 2  # Internal state mutation (e.g. todo_create)
+    LEVEL_3 = 3  # External side effect (e.g. email_send)
     LEVEL_4 = 4  # Payment Permission
 
 
@@ -44,7 +44,6 @@ class ProposedToolCall(BaseModel):
     id: str = Field(default_factory=lambda: f"tool_call_{secrets.token_hex(4)}")
     tool_name: str
     args: dict[str, Any]
-    reasoning: str = ""
 
 
 class PolicyDecision(BaseModel):
@@ -59,15 +58,6 @@ class ToolResult(BaseModel):
     tool_name: str
     success: bool
     output: Any = None
-
-
-class AgentProfile(BaseModel):
-    """Configuration for an orchestrator or specialized subagent."""
-
-    name: str
-    description: str
-    system_prompt: str
-    max_steps: int = 8
 
 
 class EventEnvelope(BaseModel):

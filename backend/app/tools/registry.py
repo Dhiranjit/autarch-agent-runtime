@@ -2,7 +2,7 @@
 
 import inspect
 from typing import Any
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from collections.abc import Callable, Sequence
 from app.core.models import RiskLevel, ToolResult
 
@@ -19,46 +19,28 @@ class Tool(BaseModel):
 
     def to_openai_tool(self) -> dict[str, Any]:
         """Convert this tool into OpenAI's native function tool payload."""
+        description = self.description
+        if self.risk_level in (RiskLevel.LEVEL_3, RiskLevel.LEVEL_4):
+            description = f"{description} [Requires user approval before execution.]"
         return {
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": description,
                 "parameters": self.parameters.model_json_schema(),
             },
         }
 
     async def execute(self, args: dict[str, Any], tool_call_id: str = "") -> ToolResult:
         """Validate arguments with the Pydantic schema and execute the tool callable."""
-        try:
-            validated = self.parameters(**args)
-        except ValidationError as exc:
-            return ToolResult(
-                tool_call_id=tool_call_id,
-                tool_name=self.name,
-                success=False,
-                output=f"Invalid arguments for tool '{self.name}': {exc}",
-            )
-
-        try:
-            kwargs = validated.model_dump()
-            if inspect.iscoroutinefunction(self.func):
-                output = await self.func(**kwargs)
-            else:
-                output = self.func(**kwargs)
-            return ToolResult(
-                tool_call_id=tool_call_id,
-                tool_name=self.name,
-                success=True,
-                output=output,
-            )
-        except Exception as exc:
-            return ToolResult(
-                tool_call_id=tool_call_id,
-                tool_name=self.name,
-                success=False,
-                output=f"Error executing tool '{self.name}': {exc}",
-            )
+        kwargs = self.parameters(**args).model_dump()
+        output = await self.func(**kwargs) if inspect.iscoroutinefunction(self.func) else self.func(**kwargs)
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            tool_name=self.name,
+            success=True,
+            output=output,
+        )
 
 
 def get_tool(tools: Sequence[Tool], name: str) -> Tool | None:

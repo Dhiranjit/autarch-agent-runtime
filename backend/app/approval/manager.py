@@ -37,41 +37,35 @@ class ApprovalManager:
         session: AsyncSession,
         task_id: str,
         tool_call: ProposedToolCall,
-        tools: Sequence[Tool] | None = None,
     ) -> Approval:
-        active_tools = list(tools) if tools is not None else self.tools
-        args_payload = dict(tool_call.args)
-        if tool_call.reasoning:
-            args_payload["_reasoning"] = tool_call.reasoning
-
         approval = Approval(
             task_id=task_id,
             tool_call_id=tool_call.id,
             tool_name=tool_call.tool_name,
-            proposed_args_json=json.dumps(args_payload),
+            proposed_args_json=json.dumps(tool_call.args),
             status=ApprovalStatus.PENDING,
         )
         session.add(approval)
         await session.flush()
 
-        tool = get_tool(active_tools, tool_call.tool_name)
+        tool = get_tool(self.tools, tool_call.tool_name)
         risk_level = int(tool.risk_level) if tool else None
 
-        audit = AuditLog(
-            task_id=task_id,
-            approval_id=approval.id,
-            event_type="approval_requested",
-            tool_name=tool_call.tool_name,
-            risk_level=risk_level,
-            policy_decision=PolicyAction.REQUIRE_APPROVAL,
-            actor="system",
-            payload_json=json.dumps({
-                "tool_call_id": tool_call.id,
-                "reasoning": tool_call.reasoning,
-                "args": tool_call.args,
-            }),
+        session.add(
+            AuditLog(
+                task_id=task_id,
+                approval_id=approval.id,
+                event_type="approval_requested",
+                tool_name=tool_call.tool_name,
+                risk_level=risk_level,
+                policy_decision=PolicyAction.REQUIRE_APPROVAL,
+                actor="system",
+                payload_json=json.dumps({
+                    "tool_call_id": tool_call.id,
+                    "args": tool_call.args,
+                }),
+            )
         )
-        session.add(audit)
         await session.commit()
         await session.refresh(approval)
 
@@ -97,8 +91,7 @@ class ApprovalManager:
             Approval.task_id == task_id,
             Approval.status == ApprovalStatus.PENDING,
         )
-        res = await session.exec(stmt)
-        return res.first() is not None
+        return (await session.exec(stmt)).first() is not None
 
     async def resolve_approval(
         self,
@@ -106,23 +99,16 @@ class ApprovalManager:
         approval_id: str,
         action: UserApprovalAction,
         resolved_by: str = "user",
-        tools: Sequence[Tool] | None = None,
     ) -> Approval:
-        active_tools = list(tools) if tools is not None else self.tools
-        statement = select(Approval).where(Approval.id == approval_id)
-        result = await session.exec(statement)
-        approval = result.one_or_none()
+        approval = await session.get(Approval, approval_id)
         if not approval:
             raise ValueError(f"Approval '{approval_id}' not found.")
 
         if approval.status != ApprovalStatus.PENDING:
             return approval
 
-        task = await session.get(Task, approval.task_id)
         now = datetime.now(timezone.utc)
         args_to_run = safe_json_loads(approval.proposed_args_json)
-        args_to_run.pop("_reasoning", None)
-
         tool_outcome: dict[str, Any] = {
             "tool_call_id": approval.tool_call_id,
             "tool_name": approval.tool_name,
@@ -131,59 +117,54 @@ class ApprovalManager:
 
         if action == UserApprovalAction.REJECT:
             approval.status = ApprovalStatus.REJECTED
-            approval.resolved_by = resolved_by
-            approval.resolved_at = now
-            session.add(approval)
             tool_outcome.update({
                 "success": False,
                 "output": f"User rejected execution of tool '{approval.tool_name}'.",
                 "status": "REJECTED",
             })
-
-            audit = AuditLog(
-                task_id=approval.task_id,
-                approval_id=approval.id,
-                event_type="approval_resolved",
-                tool_name=approval.tool_name,
-                policy_decision="REJECTED",
-                actor="user_rejected",
-                payload_json=json.dumps({"action": UserApprovalAction.REJECT}),
+            session.add(
+                AuditLog(
+                    task_id=approval.task_id,
+                    approval_id=approval.id,
+                    event_type="approval_resolved",
+                    tool_name=approval.tool_name,
+                    policy_decision="REJECTED",
+                    actor="user_rejected",
+                    payload_json=json.dumps({"action": UserApprovalAction.REJECT}),
+                )
             )
-            session.add(audit)
-
-        elif action == UserApprovalAction.APPROVE:
-            actor = "user_approved"
+        else:
             tool_result = await execute_tool(
-                active_tools,
+                self.tools,
                 approval.tool_name,
                 args_to_run,
                 tool_call_id=approval.tool_call_id,
             )
+            approval.status = ApprovalStatus.APPROVED
             tool_outcome.update({
                 "success": tool_result.success,
                 "output": tool_result.output,
                 "status": "APPROVED",
             })
-
-            approval.status = ApprovalStatus.APPROVED
-            approval.resolved_by = resolved_by
-            approval.resolved_at = now
-            session.add(approval)
-
-            audit = AuditLog(
-                task_id=approval.task_id,
-                approval_id=approval.id,
-                event_type="tool_executed" if tool_result.success else "tool_failed",
-                tool_name=approval.tool_name,
-                actor=actor,
-                payload_json=json.dumps({
-                    "args": args_to_run,
-                    "output": tool_result.output,
-                }),
+            session.add(
+                AuditLog(
+                    task_id=approval.task_id,
+                    approval_id=approval.id,
+                    event_type="tool_executed" if tool_result.success else "tool_failed",
+                    tool_name=approval.tool_name,
+                    actor="user_approved",
+                    payload_json=json.dumps({
+                        "args": args_to_run,
+                        "output": tool_result.output,
+                    }),
+                )
             )
-            session.add(audit)
 
-        # Append resolved tool output into checkpointed messages_json and step history
+        approval.resolved_by = resolved_by
+        approval.resolved_at = now
+        session.add(approval)
+
+        task = await session.get(Task, approval.task_id)
         if task:
             messages = safe_json_loads_list(task.messages_json)
             if approval.tool_call_id:
@@ -199,13 +180,9 @@ class ApprovalManager:
                 task.messages_json = json.dumps(messages)
 
             existing_result = safe_json_loads(task.result_json)
-            steps = existing_result.get("steps")
-            if isinstance(steps, list) and steps:
-                last_step = steps[-1]
-                if isinstance(last_step, dict):
-                    tool_results = last_step.setdefault("tool_results", [])
-                    if isinstance(tool_results, list):
-                        tool_results.append(tool_outcome)
+            steps = existing_result.get("steps", [])
+            if steps:
+                steps[-1].setdefault("tool_results", []).append(tool_outcome)
             existing_result.setdefault("tool_results", []).append(tool_outcome)
             task.result_json = json.dumps(existing_result)
             task.updated_at = now
